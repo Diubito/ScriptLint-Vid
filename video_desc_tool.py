@@ -45,8 +45,12 @@ TAG_RE = re.compile(r"<(?P<kind>ID|ENV)_(?P<num>\d+)>")
 BG_RE    = re.compile(r"[（(][^（）()]*[）)]")                 # （）背景声音
 VOICE_RE = re.compile(r"\{[^{}]*\}")                          # {} 人类发声
 QUOTE_RE = re.compile(r"[“\"][^“”\"]{0,300}[”\"]|‘[^‘’]{0,300}’")  # 引号=文本内容
-TIME_RE  = re.compile(r"从\s*([0-9]+(?:\.[0-9]+)?)s\s*到\s*([0-9]+(?:\.[0-9]+)?)s")  # 从X.Xs到X.Xs
-TIME_LOOSE_RE = re.compile(r"(?<![\d.])[0-9]+(?:\.[0-9]+)?s")  # 游离的时间令牌（用于提示）
+# 时间匹配（宽容）：数字与 s、数字与汉字（从/到/时）之间允许空格；
+# 但数字内部、数字与小数点之间不允许空格（_TIME_NUM 内无 \s*）。
+_TIME_NUM = r"[0-9]+(?:\.[0-9]+)?"   # 纯数字（整数或一位以上小数），内部不含空格
+TIME_RE  = re.compile(rf"从\s*({_TIME_NUM})\s*s\s*到\s*({_TIME_NUM})\s*s")  # 时间区间：从X.Xs到X.Xs
+TIME_POINT_RE = re.compile(rf"在\s*({_TIME_NUM})\s*s\s*时")  # 时间点：在X.Xs时
+TIME_LOOSE_RE = re.compile(rf"(?<![\d.]){_TIME_NUM}\s*s")  # 游离的时间令牌（用于提示）
 
 # —— <ID_x> 首次出现的五要素关键词 ——
 ANGLE_RE   = re.compile(r"平拍|俯拍|仰拍|侧拍|顶拍|斜拍|垂直俯拍|大俯拍|鸟瞰|仰视|俯视|平视|仰角|俯角|低角度|高角度|正面拍|背面拍|侧面拍")
@@ -129,6 +133,8 @@ def parse_parts(text):
         spans.append((m.start(), m.end(), "quote"))
     for m in TIME_RE.finditer(text):
         spans.append((m.start(), m.end(), "time"))
+    for m in TIME_POINT_RE.finditer(text):
+        spans.append((m.start(), m.end(), "time"))
     return spans
 
 
@@ -155,20 +161,24 @@ def clean_show(s):
 
 
 def check_time_precision(text):
-    """时间须精确到小数点后一位。返回 [(start,end,msg)]"""
+    """时间须精确到小数点后一位。返回 [(start,end,msg)]
+    覆盖两种格式：区间“从X.Xs到X.Xs”与时间点“在X.Xs时”。"""
     issues = []
     for m in TIME_RE.finditer(text):
         for g in (m.group(1), m.group(2)):
             if not re.fullmatch(r"\d+\.\d", g):
                 issues.append((m.start(), m.end(), f"时间“{g}s”须精确到小数点后一位，格式为“从X.Xs到X.Xs”"))
+    for m in TIME_POINT_RE.finditer(text):
+        g = m.group(1)
+        if not re.fullmatch(r"\d+\.\d", g):
+            issues.append((m.start(), m.end(), f"时间“{g}s”须精确到小数点后一位，格式为“在X.Xs时”"))
     return issues
 
 
 def check_time_loose(text, excluded):
-    """游离时间令牌（不在 从…s到…s 结构内）给出格式提示。excluded 为局部区间列表。
-    “在X.Xs时”属于合法时间点写法，不提示。"""
+    """游离时间令牌（不在 从…s到…s 或 在…s时 结构内）给出格式提示。excluded 为局部区间列表。"""
     issues = []
-    point_spans = [m.span() for m in re.finditer(r"在\s*[0-9]+(?:\.[0-9]+)?s\s*时", text)]
+    point_spans = [m.span() for m in TIME_POINT_RE.finditer(text)]
     for m in TIME_LOOSE_RE.finditer(text):
         pos = m.start()
         if any(s <= pos < e for s, e in excluded):
@@ -177,7 +187,7 @@ def check_time_loose(text, excluded):
             continue
         if any(s <= pos < e for s, e in point_spans):
             continue
-        issues.append((m.start(), m.end(), f"发现时间“{m.group(0)}”，建议按格式“从X.Xs到X.Xs”书写"))
+        issues.append((m.start(), m.end(), f"发现时间“{m.group(0)}”，建议按格式“从X.Xs到X.Xs”或“在X.Xs时”书写"))
     return issues
 
 
@@ -366,6 +376,7 @@ SAMPLE_TEXT = (
     "{男子轻声说道}“准备开始”，从0.0s到1.2s。"
     "背景<ENV_1>是老式房屋前的室外区域全景，地面铺蓝色橡胶垫，画面顶部是锈蚀波纹屋顶。"
     "从1.2s到2.8s，这名男性重心移到右腿，双臂缓慢画圆弧，镜头轻微右摇。"
+    "在3.5s时，镜头保持静止。"
     "<ID_2>俯拍一辆叉车的中景，位于画面右侧，背面朝镜头，从8.1s到12.4s。"
     "<ID_3>拍一名工人在左侧从20s到22.5s？"
 )
@@ -380,7 +391,7 @@ LEGEND = [
     ("bg",       "（ ）背景声音描述"),
     ("voice",    "{ } 人类发声"),
     ("quote",    "“ ” 引号内文本内容"),
-    ("time",     "时间：从X.Xs到X.Xs"),
+    ("time",     "时间：从X.Xs到X.Xs / 在X.Xs时"),
     ("current",  "当前编辑块（光标所在句）"),
     ("processed", "已处理块（文字变灰）"),
     ("chunk_editing", "选中的“语块”（正在编辑）"),
@@ -403,6 +414,12 @@ class App:
         self.current_idx = 0
         self.done_keys = set()
         self._parse_job = None
+        # 自动联想补全状态
+        self._prev_text = ""
+        self._ac_top = None
+        self._ac_listbox = None
+        self._ac_items = []
+        self._ac_start_idx = None
 
         self.topmost_var = tk.BooleanVar(value=True)
         root.attributes("-topmost", True)
@@ -514,8 +531,15 @@ class App:
             "   【位置】【朝向】，缺失会提示；\n"
             "6. “画面左/右侧”“人物左侧”视为正确；若只写“左侧/\n"
             "   右侧”参照系不明，会提示补全；\n"
-            "7. 时间精确到小数点后一位（从X.Xs到X.Xs）；\n"
-            "8. 合法标点：逗号、句号、顿号；其余标点会告警并标红。\n\n"
+            "7. 时间精确到小数点后一位：区间“从X.Xs到X.Xs”、\n"
+            "   时间点“在X.Xs时”均会高亮并校验；数字与 s、数字与\n"
+            "   汉字之间允许空格（数字内部、数字与小数点处不允许）；\n"
+            "8. 合法标点：逗号、句号、顿号；其余标点会告警并标红。\n"
+            "9. 输入“<”弹出标签联想（↑↓选择，回车/Tab 确认，\n"
+            "   Esc 关闭）；选择后自动补全标签并在标签前后补空格；\n"
+            "10. 输入“从”弹出时间模板“从 s到 s”，选择后光标\n"
+            "    停在“从”后；输入“在”弹出模板“在 s时”，选择后\n"
+            "    光标停在“在”后，便于直接填写时间。\n\n"
             "“示例（只读）”在独立只读窗口中演示，不影响你的文本。\n"
             "“保存”会把当前文本与处理进度存到本地 .json。"
         )
@@ -525,7 +549,9 @@ class App:
         self.status = ttk.Label(self.root, relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2))
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # 鼠标位置决定当前块
+        # 鼠标位置决定当前块；拖选时实时显示“语块”高亮（无需松开鼠标）
+        self.text.bind("<ButtonPress-1>", self._on_drag_begin)
+        self.text.bind("<B1-Motion>", self._on_drag_move)
         self.text.bind("<ButtonRelease-1>", self._on_click)
         self.text.bind("<KeyRelease>", self._on_key)
         self.text.bind("<<Paste>>", lambda e: self._schedule_parse())
@@ -546,6 +572,7 @@ class App:
     def parse_all(self):
         text = self.text.get("1.0", "end-1c")
         self.raw_text = text
+        self._prev_text = text
         self.parts, self.blocks, self.issues = analyze_text(text)
         # 保留已完成状态（按句子内容）
         for b in self.blocks:
@@ -569,13 +596,26 @@ class App:
         self._on_selection()
         self.update_current_from_caret()
         self._schedule_parse()
+        # 自动联想：检测刚输入的字符
+        ch = self._detect_typed_char()
+        if ch == "<":
+            self._show_tag_suggestions()
+        elif ch == "从":
+            self._show_time_suggestions()
+        elif ch == "在":
+            self._show_za_suggestions()
+        elif self._ac_active() and ch and ch not in ("<", "从", "在"):
+            self._ac_close()
         return None
 
     def _on_click(self, event=None):
         self._on_selection()
         self.update_current_from_caret()
+        if self._ac_active():
+            self._ac_close()
 
     def _on_selection(self, event=None):
+        """把当前选择范围加上“语块”高亮；拖选过程中也会被持续调用。"""
         t = self.text
         t.tag_remove("chunk_editing", "1.0", "end")
         try:
@@ -584,6 +624,191 @@ class App:
             return
         if sel:
             t.tag_add("chunk_editing", sel[0], sel[1])
+
+    def _on_drag_begin(self, event=None):
+        # 按下鼠标：清除旧的语块高亮，开始新选择
+        self.text.tag_remove("chunk_editing", "1.0", "end")
+
+    def _on_drag_move(self, event=None):
+        # 拖选过程中实时刷新语块高亮，无需松开鼠标即可看到选择了哪些文字
+        self._on_selection()
+
+    # ---------- 自动联想补全 ----------
+    def _detect_typed_char(self):
+        """返回刚输入的单个字符（用于触发联想；兼容输入法整字上屏）。"""
+        cur = self.text.get("1.0", "end-1c")
+        prev = getattr(self, "_prev_text", None)
+        self._prev_text = cur
+        if prev is None or cur == prev:
+            return ""
+        try:
+            return self.text.get("insert-1c", "insert")
+        except tk.TclError:
+            return ""
+
+    def _tag_candidates(self):
+        """标签候选项：文档中已使用的 <ID_x>/<ENV_x> + 各新建一个序号。"""
+        text = self.text.get("1.0", "end-1c")
+        used = {"ID": set(), "ENV": set()}
+        for m in TAG_RE.finditer(text):
+            used[m.group("kind")].add(int(m.group("num")))
+        items = []
+        seen = set()
+
+        def add(kind, n, suffix=""):
+            key = f"<{kind}_{n}>"
+            if key not in seen:
+                seen.add(key)
+                items.append((key + suffix, key, len(key), True))
+
+        for kind in ("ID", "ENV"):
+            for n in sorted(used[kind]):
+                add(kind, n)
+            nxt = max(used[kind]) + 1 if used[kind] else 1
+            add(kind, nxt, "（新建）")
+        return items
+
+    def _time_candidates(self):
+        """时间模板：从 s到 s（选择后光标停在“从”后）。"""
+        tmpl = "从 s到 s"
+        return [(tmpl, tmpl, 1, False)]
+
+    def _za_candidates(self):
+        """时间点模板：在 s时（选择后光标停在“在”后）。"""
+        tmpl = "在 s时"
+        return [(tmpl, tmpl, 1, False)]
+
+    def _caret_xy(self):
+        try:
+            bx, by, bw, bh = self.text.bbox("insert")
+        except tk.TclError:
+            bx, by, bw, bh = 10, 10, 0, 0
+        return self.text.winfo_rootx() + bx, self.text.winfo_rooty() + by + bh
+
+    def _show_tag_suggestions(self):
+        self._ac_start_idx = self.text.index("insert-1c")
+        self._ac_show(self._tag_candidates())
+
+    def _show_time_suggestions(self):
+        self._ac_start_idx = self.text.index("insert-1c")
+        self._ac_show(self._time_candidates())
+
+    def _show_za_suggestions(self):
+        self._ac_start_idx = self.text.index("insert-1c")
+        self._ac_show(self._za_candidates())
+
+    def _ac_show(self, items):
+        self._ac_close()
+        if not items:
+            return
+        self._ac_items = items
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        lb = tk.Listbox(top, font=("Microsoft YaHei UI", 11),
+                        height=min(len(items), 8), exportselection=False,
+                        activestyle="dotbox", selectbackground="#CCE5FF",
+                        selectforeground="#000000")
+        lb.pack(fill=tk.BOTH, expand=True)
+        for disp, ins, cur_off, add_sp in items:
+            lb.insert(tk.END, disp)
+        lb.selection_set(0)
+        x, y = self._caret_xy()
+        # 防止超出屏幕底部
+        h = 24 * min(len(items), 8)
+        scr_h = self.root.winfo_screenheight()
+        if y + h > scr_h - 40:
+            y = max(40, scr_h - 40 - h)
+        top.geometry(f"+{x}+{y}")
+        top.deiconify()
+        self._ac_top = top
+        self._ac_listbox = lb
+        # 键盘导航：焦点保持在文本框
+        self.text.bind("<Down>", self._ac_down)
+        self.text.bind("<Up>", self._ac_up)
+        self.text.bind("<Return>", self._ac_enter)
+        self.text.bind("<KP_Enter>", self._ac_enter)
+        self.text.bind("<Escape>", self._ac_escape)
+        self.text.bind("<Tab>", self._ac_enter)
+        lb.bind("<ButtonRelease-1>", lambda e: self._ac_accept())
+        self.text.focus_set()
+
+    def _ac_active(self):
+        return self._ac_top is not None
+
+    def _ac_close(self):
+        if self._ac_top is not None:
+            try:
+                self._ac_top.destroy()
+            except tk.TclError:
+                pass
+            self._ac_top = None
+            self._ac_listbox = None
+            self._ac_items = []
+            for seq in ("<Down>", "<Up>", "<Return>", "<KP_Enter>", "<Escape>", "<Tab>"):
+                try:
+                    self.text.unbind(seq)
+                except tk.TclError:
+                    pass
+
+    def _ac_down(self, e=None):
+        lb = self._ac_listbox
+        sel = lb.curselection()
+        nxt = (sel[0] + 1) if sel else 0
+        if nxt < lb.size():
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(nxt)
+            lb.see(nxt)
+        return "break"
+
+    def _ac_up(self, e=None):
+        lb = self._ac_listbox
+        sel = lb.curselection()
+        nxt = (sel[0] - 1) if sel else 0
+        if nxt >= 0:
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(nxt)
+            lb.see(nxt)
+        return "break"
+
+    def _ac_enter(self, e=None):
+        self._ac_accept()
+        return "break"
+
+    def _ac_escape(self, e=None):
+        self._ac_close()
+        return "break"
+
+    def _ac_accept(self):
+        lb = self._ac_listbox
+        if lb is None:
+            return
+        sel = lb.curselection()
+        idx = sel[0] if sel else 0
+        if 0 <= idx < len(self._ac_items):
+            self._do_ac_insert(idx)
+        self._ac_close()
+
+    def _do_ac_insert(self, idx):
+        display, insert_text, cursor_chars, add_spaces = self._ac_items[idx]
+        t = self.text
+        t.delete(self._ac_start_idx, "insert")
+        before = t.get("insert-1c", "insert") if t.compare("insert", ">", "1.0") else ""
+        after = t.get("insert", "insert+1c") if t.compare("insert", "<", "end-1c") else ""
+        prefix = suffix = ""
+        if add_spaces:
+            if before and not before.isspace():
+                prefix = " "
+            if after and not after.isspace():
+                suffix = " "
+        t.insert("insert", prefix + insert_text + suffix)
+        total = len(prefix) + len(insert_text) + len(suffix)
+        ins_start = t.index(f"insert-{total}c")
+        cur = f"{ins_start}+{len(prefix) + cursor_chars}c"
+        t.mark_set("insert", cur)
+        t.see("insert")
+        self._prev_text = t.get("1.0", "end-1c")
+        self._schedule_parse()
 
     # ---------- 当前块（按光标/鼠标位置） ----------
     def _tk_index_to_offset(self, idx):
@@ -702,7 +927,12 @@ class App:
             return
         b = self.blocks[self.current_idx]
         tag = b.tag_text if b.tag_text else "(无标签)"
-        first_txt = "，含 ID 首次出现，五要素检查" if b.checklist is not None else ""
+        if b.checklist is not None:
+            first_txt = "，含 ID 首次出现，五要素检查"
+        elif b.kind == "ID":
+            first_txt = "，ID 非首次（已读取五要素）"
+        else:
+            first_txt = ""
         self.cur_info.config(text=f"当前块：{tag}{first_txt}")
         if b.checklist is not None:
             for e in ELEMENTS:
@@ -715,14 +945,23 @@ class App:
             note = "✓ 五要素齐全" if not missing else f"缺少：{'、'.join(missing)}"
             self.cur_note.config(text=note, foreground=("#1a7f37" if not missing else "#c00000"))
         else:
-            for e in ELEMENTS:
-                self.check_rows[e].config(text="—", foreground="#000000")
-            if b.kind == "ENV":
-                self.cur_note.config(text="ENV 环境句：不进行 ID 五要素检查", foreground="#666666")
-            elif b.kind == "ID":
-                self.cur_note.config(text="ID 非首次出现：跳过五要素检查", foreground="#666666")
+            if b.kind == "ID":
+                # 非首次出现：同样读取五要素并展示（仅展示，不告警）
+                read = check_id_elements(b.text)
+                for e in ELEMENTS:
+                    v = clean_show(read.get(e))
+                    if v:
+                        self.check_rows[e].config(text=v, foreground="#1a7f37")
+                    else:
+                        self.check_rows[e].config(text="—", foreground="#999999")
+                self.cur_note.config(text="ID 非首次出现：已读取五要素（仅供参考）", foreground="#666666")
             else:
-                self.cur_note.config(text="无标签句子：默认处理单元（以句号切分）", foreground="#666666")
+                for e in ELEMENTS:
+                    self.check_rows[e].config(text="—", foreground="#000000")
+                if b.kind == "ENV":
+                    self.cur_note.config(text="ENV 环境句：不进行 ID 五要素检查", foreground="#666666")
+                else:
+                    self.cur_note.config(text="无标签句子：默认处理单元（以句号切分）", foreground="#666666")
         # 各部分统计
         cnt = {"背景声": 0, "人声": 0, "文本": 0, "时间": 0}
         for s, e, k in self.parts:
@@ -814,8 +1053,11 @@ def self_test():
     assert any("？" in m for m in errs), "应有问号标点告警"
     assert any("20s" in m for m in errs), "应有时间精度告警"
     assert any("参照系不明确" in m for m in errs), "应有参照系歧义告警"
+    # 时间点“在X.Xs时”应被识别为时间部分（高亮）
+    time_parts = [SAMPLE_TEXT[s:e] for s, e, k in parts if k == "time"]
+    assert any("在3.5s时" in seg for seg in time_parts), "时间点“在3.5s时”应被识别为时间"
     # 块数量应多于1（句号切分生效）
-    assert len(blocks) >= 7, f"应按句号切分出多个块，实际 {len(blocks)}"
+    assert len(blocks) >= 8, f"应按句号切分出多个块，实际 {len(blocks)}"
     print("\n自测通过 ✔")
 
 
