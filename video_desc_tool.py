@@ -201,7 +201,11 @@ def check_time_loose(text, excluded):
 
 
 def _all_time_spans(text):
-    return [m.span() for m in TIME_RE.finditer(text)]
+    """全部时间匹配区间（区间、时间点、游离令牌）：内部空格全部豁免。"""
+    spans = [m.span() for m in TIME_RE.finditer(text)]
+    spans += [m.span() for m in TIME_POINT_RE.finditer(text)]
+    spans += [m.span() for m in TIME_LOOSE_RE.finditer(text)]
+    return spans
 
 
 def check_punctuation(text, excluded):
@@ -223,6 +227,33 @@ def check_punctuation(text, excluded):
             continue
         issues.append((m.start(), m.end(), "标点", f"出现连续标点“{m.group(0)}”，逗号/句号/顿号不应连用"))
     return issues
+
+
+def check_space(text, time_spans, tag_spans):
+    """空格用词告警：时间戳内部、标签前后、英文字母前后的空格除外。返回 [(start, end, msg)]
+    time_spans：宽容匹配到的时间区间（内部允许“数字与s/汉字”之间空格）；
+    tag_spans：结构标签区间（联想补全会在标签前后各补一个空格）；
+    英文豁免：空格紧贴 ASCII 字母（如 “1.0 s” 的 s、“video 描述” 的 video）不告警。"""
+    issues = []
+    for i, ch in enumerate(text):
+        if ch not in (" ", "\u3000"):
+            continue
+        if any(s <= i < e for s, e in time_spans):
+            continue  # 时间戳内部
+        if any(i == s - 1 or i == e for s, e in tag_spans):
+            continue  # 标签前后
+        prev_alpha = i > 0 and text[i - 1].isascii() and text[i - 1].isalpha()
+        next_alpha = i + 1 < len(text) and text[i + 1].isascii() and text[i + 1].isalpha()
+        if prev_alpha or next_alpha:
+            continue  # 英文字母前后
+        issues.append((i, i + 1, "出现空格：除时间戳内部、标签前后、英文字母前后外，文本中不应出现空格"))
+    return issues
+
+
+def check_newline(text):
+    """换行符弱提示（hint）：在问题列表以 ⏎ 标识；文本区不加 tag（换行 tag 背景会铺满整行）。返回 [(start, end, msg)]"""
+    return [(i, i + 1, "⏎ 换行符（如需合并文本，可选中后点“完成选中块”自动删除）")
+            for i, ch in enumerate(text) if ch == "\n"]
 
 
 def check_pairing(text, excluded):
@@ -390,6 +421,12 @@ def analyze_text(text):
         # “屏幕”用词
         for s, e, lvl, msg in check_screen(seg):
             issues.append(Issue(b.start + s, b.start + e, lvl, "用语", bi + 1, f"句{bi + 1}: {msg}"))
+        # 空格（时间戳内部、标签前后、英文字母前后除外）
+        for s, e, msg in check_space(seg, local_time, local_tags):
+            issues.append(Issue(b.start + s, b.start + e, "error", "空格", bi + 1, f"句{bi + 1}: {msg}"))
+        # 换行符弱提示
+        for s, e, msg in check_newline(seg):
+            issues.append(Issue(b.start + s, b.start + e, "hint", "换行", bi + 1, f"句{bi + 1}: {msg}"))
     # 标签记忆：每个 <ID_x> 按首次出现识别五要素；未完整时允许后续出现补齐，
     # 一旦五个元素都识别到即锁定，后面不再覆盖。
     memory = {}
@@ -518,8 +555,10 @@ def apply_highlights_to(widget, text, parts, blocks, issues, current_idx):
         if k == "quality":
             continue
         widget.tag_add(k, f"1.0+{s}c", f"1.0+{e}c")
-    # 4) 问题
+    # 4) 问题（换行弱提示不加 tag：tag 背景加在换行符上会铺满整行，只在问题列表用 ⏎ 标识）
     for iss in issues:
+        if iss.kind == "换行":
+            continue
         tag = "error" if iss.level == "error" else "hint"
         end = max(iss.end, iss.start + 1)
         widget.tag_add(tag, f"1.0+{iss.start}c", f"1.0+{end}c")
@@ -627,6 +666,7 @@ class App:
 
         ttk.Button(top, text="解析/重检 (F5)", command=self.parse_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="完成当前块 (Ctrl+Enter)", command=self.mark_done).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="完成选中块", command=self.mark_selected_done).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="全部重置", command=self.reset_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="保存 (Ctrl+S)", command=self.save).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="示例（只读）", command=self.show_sample).pack(side=tk.LEFT, padx=2)
@@ -1065,21 +1105,77 @@ class App:
             self.refresh()
 
     # ---------- 块状态 ----------
+    def _saved_view(self):
+        """保存文本框当前滚动位置，供完成/重置后恢复。"""
+        try:
+            return self.text.yview()[0]
+        except tk.TclError:
+            return None
+
+    def _restore_view(self, y0):
+        if y0 is not None:
+            try:
+                self.text.yview_moveto(y0)
+            except tk.TclError:
+                pass
+
     def mark_done(self):
         if not self.blocks:
             return
+        y0 = self._saved_view()
         b = self.blocks[self.current_idx]
         b.done = True
         self.done_keys.add(key_of_block(b))
         self.refresh()
+        self._restore_view(y0)
         self._set_status(f"已标记块 {self.current_idx + 1} 完成（光标所在句）。")
 
+    def mark_selected_done(self):
+        """完成选中的所有块（与选区有交集的块），并删除选中区域内的换行。
+        删除换行后重新解析；被删换行块的完成状态按“去换行文本包含匹配”恢复。"""
+        t = self.text
+        sel = t.tag_ranges("sel")
+        if not sel or not self.blocks:
+            self.mark_done()
+            return
+        s_off = self._tk_index_to_offset(sel[0])
+        e_off = self._tk_index_to_offset(sel[1])
+        sel_blocks = [b for b in self.blocks if b.start < e_off and b.end > s_off]
+        if not sel_blocks:
+            self.mark_done()
+            return
+        y0 = self._saved_view()
+        for b in sel_blocks:
+            b.done = True
+            self.done_keys.add(key_of_block(b))
+        n = len(sel_blocks)
+        sel_text = t.get(sel[0], sel[1])
+        if "\n" in sel_text:
+            t.delete(sel[0], sel[1])
+            t.insert(sel[0], sel_text.replace("\n", ""))
+            self._prev_text = t.get("1.0", "end-1c")
+            self.parse_all()
+            # 被删换行的块重新标记完成（去换行后文本包含匹配，兼容块合并）
+            old_clean = [b.text.replace("\n", "") for b in sel_blocks]
+            for b in self.blocks:
+                nb = b.text.replace("\n", "")
+                if any(oc and (nb == oc or oc in nb or nb in oc) for oc in old_clean):
+                    b.done = True
+                    self.done_keys.add(key_of_block(b))
+            self.refresh()
+        else:
+            self.refresh()
+        self._restore_view(y0)
+        self._set_status(f"已标记选中 {n} 个块完成" + ("，并删除选中区域内的换行。" if "\n" in sel_text else "。"))
+
     def reset_all(self):
+        y0 = self._saved_view()
         self.done_keys = set()
         for b in self.blocks:
             b.done = False
         self.current_idx = 0
         self.refresh(scroll=True)
+        self._restore_view(y0)
         self._set_status("已重置所有块的处理状态。")
 
     def _on_block_select(self, event=None):
@@ -1333,6 +1429,26 @@ def self_test():
     assert any("前缺“的”" in m for m in errs), "应有景别前缺“的”告警"
     assert any("参照系不明确" in m for m in errs), "应有参照系歧义告警"
     assert any("接着" in m or "可以看到" in m for m in hints), "应有衔接词提示"
+    # 空格告警：普通空格告警；时间戳内部、标签前后、英文字母前后不告警
+    assert any("空格" in m for _, _, m in check_space("画面 中央", [], [])), "普通空格应告警"
+    ts = [(0, len("从1.0 s到 2.5s"))]
+    assert not any("空格" in m for _, _, m in check_space("从1.0 s到 2.5s", ts, [])), "时间戳内空格不应告警"
+    assert not any("空格" in m for _, _, m in check_space("<ID_1> 男子", [], [(0, 6)])), "标签后空格不应告警"
+    assert not any("空格" in m for _, _, m in check_space("男子 <ID_1>", [], [(3, 9)])), "标签前空格不应告警"
+    assert not any("空格" in m for _, _, m in check_space("1.0 s 时", [(0, len("1.0 s 时"))], [])), "时间点内空格不应告警"
+    assert not any("空格" in m for _, _, m in check_space("video 描述", [], [])), "英文字母后空格不应告警"
+    assert not any("空格" in m for _, _, m in check_space("描述 video", [], [])), "英文字母前空格不应告警"
+    assert any("空格" in m for _, _, m in check_space("在 1.0 s 时", [], [])), "未给时间区间时空格仍应告警"
+    # 换行弱提示
+    assert any("⏎" in m for _, _, m in check_newline("第一句。\n第二句。")), "换行符应有弱提示"
+    assert not any("换行符" in m for _, _, m in check_newline("无换行文本。")), "无换行不应提示"
+    # 已完成块被修改后回到未完成：完成状态以块文本为键，文本变更即失效
+    txt2 = "平拍一名<ID_1>男子的全景，位于画面中央。俯拍一辆叉车的中景，位于画面右侧。"
+    _, b2_, _, _ = analyze_text(txt2)
+    done_keys = {key_of_block(b2_[0])}
+    _, b3_, _, _ = analyze_text(txt2.replace("全景", "特写"))
+    assert all(not b.done for b in b3_), "修改后块应回到未完成"
+    assert key_of_block(b3_[0]) not in done_keys, "修改后文本键应失效"
     # 时间点“在X.Xs时”应被识别为时间部分（高亮）
     time_parts = [SAMPLE_TEXT[s:e] for s, e, k in parts if k == "time"]
     assert any("在3.5s时" in seg for seg in time_parts), "时间点“在3.5s时”应被识别为时间"
