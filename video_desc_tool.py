@@ -58,7 +58,7 @@ SUBJECT_RE = re.compile(
     r"(?:一名|一位|一个|一辆|一台|一只|一艘|一架|一栋|一幢|一间|一张|一条|一根|一块|一片|一排|一群|两名|两位|几辆|几台|数名|多人|两个人)"
     r"(?:<ID_\d+>|<ENV_\d+>|[^，。；、？！（）(){}“”\"<>从到]){1,15}")
 SUBJECT_NO_RE = re.compile(r"工人|学生|店员|顾客|司机|老人|女孩|男孩|女人|男人|警察|医生|演员|角色|人群|行人|车辆|叉车|卡车|货车|轿车|汽车|机器|设备|无人机|监控|摄像头|建筑|楼房|招牌|货架|箱子|桌子|椅子|窗口|大门|货品|商品|树叶|花朵|树木|动物|猫|狗")
-SHOT_RE    = re.compile(r"大远景|极远景|大全景|全景|中近景|中景|近景|大特写|特写|小全景")
+SHOT_RE    = re.compile(r"大远景|极远景|大全景|牛仔景别|全景|中近景|中景|近景|大特写|特写|小全景")
 POSITION_RE = re.compile(r"画面(的)?((左|右)(侧|边|方|上角|下角)|中央|正中|中心|顶部|底部)|(左|右)(侧|边|方|部)|中央|居中|正中|中心|左上|左下|右上|右下|上方|下方|顶部|底部|偏左|偏右|前景|后景")
 ORIENT_RE  = re.compile(r"正面|背面|半侧面|侧面|侧身|正对镜头|背对镜头|面对镜头|背对|正对|朝镜头|面向镜头|朝向镜头|侧向镜头|背朝镜头")
 
@@ -74,7 +74,7 @@ PAIR_PAIRS = [("（", "）"), ("(", ")"), ("{", "}"), ("“", "”"), ("‘", "�
 STYLE_WARN_RE = re.compile(r"接着|可以看到|可以观察")
 
 # 景别类描述词：前面必须有“的”（如“XXX的远景”），长词在前避免子串误匹配
-SHOT_DE_RE = re.compile(r"大远景|极远景|大全景|中近景|大特写|小全景|全景|中景|近景|特写|远景|后景")
+SHOT_DE_RE = re.compile(r"牛仔景别|大远景|极远景|大全景|中近景|大特写|小全景|全景|中景|近景|特写|远景|后景")
 
 
 class Issue:
@@ -160,7 +160,11 @@ def check_id_elements(text):
     found["主体"] = m.group(0) if m else None
     found["景别"] = find(SHOT_RE)
     found["位置"] = find(POSITION_RE)
-    found["朝向"] = find(ORIENT_RE)
+    m = ORIENT_RE.search(text)
+    if m and m.start() > 0 and text[m.start() - 1] == "面":
+        found["朝向"] = None  # “面朝镜头”非法表述（“朝镜头”是“面朝镜头”的子串），不算合法朝向
+    else:
+        found["朝向"] = m.group(0) if m else None
     return found
 
 
@@ -338,6 +342,19 @@ def check_screen(text):
     return issues
 
 
+def check_face_cam(text):
+    """“面朝镜头”非法表述：朝向必须用“正面”“背面”或“半侧面”。
+    排除“正面/背面/侧面/半侧面朝镜头”等合法组合（负向断言看前一字）。返回 [(start, end, msg)]"""
+    return [(m.start(), m.end(), "“面朝镜头”非法：朝向应使用“正面”“背面”或“半侧面”")
+            for m in re.finditer(r"(?<![正面背侧半])面朝镜头", text)]
+
+
+def check_pattern(text):
+    """“图案”用词告警（常为“画面”的误写，如“图案右侧”）。返回 [(start, end, msg)]"""
+    return [(m.start(), m.end(), "出现“图案”，建议改为“画面”（如“图案右侧”应为“画面右侧”）")
+            for m in re.finditer(r"图案", text)]
+
+
 def quality_spans(text):
     """返回“以‘视听质量’开头的句子”区间列表 [(start, end)]。
     句子起点 = 文本开头或句末标点（。？！!；）之后的“视听质量”；
@@ -421,6 +438,12 @@ def analyze_text(text):
         # “屏幕”用词
         for s, e, lvl, msg in check_screen(seg):
             issues.append(Issue(b.start + s, b.start + e, lvl, "用语", bi + 1, f"句{bi + 1}: {msg}"))
+        # “面朝镜头”非法表述
+        for s, e, msg in check_face_cam(seg):
+            issues.append(Issue(b.start + s, b.start + e, "error", "朝向", bi + 1, f"句{bi + 1}: {msg}"))
+        # “图案”用词（画面误写）
+        for s, e, msg in check_pattern(seg):
+            issues.append(Issue(b.start + s, b.start + e, "error", "用语", bi + 1, f"句{bi + 1}: {msg}"))
         # 空格（时间戳内部、标签前后、英文字母前后除外）
         for s, e, msg in check_space(seg, local_time, local_tags):
             issues.append(Issue(b.start + s, b.start + e, "error", "空格", bi + 1, f"句{bi + 1}: {msg}"))
@@ -475,6 +498,9 @@ def _id_tag_name(widget, num):
 
 
 def configure_tags(widget):
+    # 换行标记最后创建（Tk 9 中后创建的 tag 优先级更高，tag_names 低→高），
+    # 确保行末色块不被 current/processed/bg 等背景覆盖；注意不得调用
+    # tag_raise——Tk 9 中 raise 会把该 tag 降到最底层
     widget.tag_configure("id_tag", background="#FFF3A6", foreground="#8B6914",
                          font=("Microsoft YaHei UI", 12, "bold"), borderwidth=0, relief="flat")
     widget.tag_configure("env_tag", background="#EBDCF8", foreground="#7A3FA0",
@@ -555,7 +581,7 @@ def apply_highlights_to(widget, text, parts, blocks, issues, current_idx):
         if k == "quality":
             continue
         widget.tag_add(k, f"1.0+{s}c", f"1.0+{e}c")
-    # 4) 问题（换行弱提示不加 tag：tag 背景加在换行符上会铺满整行，只在问题列表用 ⏎ 标识）
+    # 4) 问题（换行 Issue 仅保留右侧问题列表的 ⏎ 弱提示，文本区不再做任何标记）
     for iss in issues:
         if iss.kind == "换行":
             continue
@@ -941,8 +967,8 @@ class App:
         return [(tmpl, tmpl, 1, False)]
 
     def _za_candidates(self):
-        """时间点模板：在 s时（选择后光标停在“在”后）。"""
-        tmpl = "在 s时"
+        """时间点模板：在 s时，（选择后光标停在“在”后）。"""
+        tmpl = "在 s时，"
         return [(tmpl, tmpl, 1, False)]
 
     def _caret_xy(self):
@@ -1198,7 +1224,8 @@ class App:
 
     # ---------- 高亮与面板刷新 ----------
     def _apply_highlights(self):
-        apply_highlights_to(self.text, self.raw_text, self.parts, self.blocks, self.issues, self.current_idx)
+        apply_highlights_to(self.text, self.raw_text, self.parts, self.blocks, self.issues,
+                            self.current_idx)
 
     def refresh(self, scroll=False):
         self._apply_highlights()
@@ -1442,6 +1469,12 @@ def self_test():
     # 换行弱提示
     assert any("⏎" in m for _, _, m in check_newline("第一句。\n第二句。")), "换行符应有弱提示"
     assert not any("换行符" in m for _, _, m in check_newline("无换行文本。")), "无换行不应提示"
+    # 连续换行（空行）时换行标记位置验证：Issue 位于换行符处（仅右侧列表 ⏎ 提示用）
+    _nl_txt = "第一句。\n\n第二句。"
+    _, _blk, _iss, _ = analyze_text(_nl_txt)
+    _nl_pos = [_i.start for _i in _iss if _i.kind == "换行"]
+    assert _nl_pos, "应有换行提示位置"
+    assert all(_nl_txt[p] == "\n" for p in _nl_pos), "换行提示应位于换行符处"
     # 已完成块被修改后回到未完成：完成状态以块文本为键，文本变更即失效
     txt2 = "平拍一名<ID_1>男子的全景，位于画面中央。俯拍一辆叉车的中景，位于画面右侧。"
     _, b2_, _, _ = analyze_text(txt2)
@@ -1465,6 +1498,26 @@ def self_test():
     # “屏幕”用词告警（“屏幕左侧”交给参照系，不重复；“屏幕顶部”单独告警）
     assert any("画面" in m and "屏幕" in m for _, _, _, m in check_screen("屏幕顶部有裂缝")), "屏幕用词应告警"
     assert not any("屏幕" in m for _, _, _, m in check_screen("位于屏幕左侧")), "屏幕左/右不应重复告警"
+    # “面朝镜头”非法
+    assert any("面朝镜头" in m for _, _, m in check_face_cam("平拍一名男子的全景，面朝镜头。")), "面朝镜头应告警"
+    assert not any("面朝镜头" in m for _, _, m in check_face_cam("正面朝镜头。")), "正面朝镜头不应告警"
+    # “面朝镜头”不算合法朝向（首次五要素中朝向缺失）
+    ck = check_id_elements("平拍一名<ID_1>男子的全景，位于画面中央，面朝镜头。")
+    assert not ck["朝向"], "面朝镜头不应被识别为朝向"
+    ck2 = check_id_elements("平拍一名<ID_1>男子的全景，位于画面中央，正面朝镜头。")
+    assert ck2["朝向"], "正面应被识别为朝向"
+    # 牛仔景别加入合法景别；大全景本就合法
+    ck3 = check_id_elements("俯拍一名<ID_1>骑手的牛仔景别，位于画面左侧，背面朝镜头。")
+    assert ck3["景别"] == "牛仔景别", "牛仔景别应被识别"
+    assert SHOT_RE.search("大全景"), "大全景应合法"
+    # 首次出现未满足即报错，后续补齐不影响首次告警
+    txt_f = "平拍一名<ID_1>男子，位于画面中央。\n<ID_1>正面朝镜头，俯拍全景。"
+    _, _, iss_f, mem_f = analyze_text(txt_f)
+    assert any("首次出现" in i.message and "未识别到" in i.message for i in iss_f), "首次缺失应报错"
+    assert all(v for v in mem_f["<ID_1>"].values()), "补齐后记忆应完整"
+    assert any("首次出现" in i.message and "未识别到" in i.message for i in iss_f), "补齐后首次报错不应撤销"
+    # “图案”用词
+    assert any("图案" in m for _, _, m in check_pattern("位于图案右侧。")), "图案应告警"
     # 连续标点
     assert any("连续标点" in m for _, _, _, m in check_punctuation("画面，，细节", [])), "连续标点应告警"
     # 块数量应多于1（句号切分生效）
