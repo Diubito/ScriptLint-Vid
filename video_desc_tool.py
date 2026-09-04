@@ -67,6 +67,15 @@ ELEMENTS = ["视角", "主体", "景别", "位置", "朝向"]
 # 不允许出现的标点（结构分隔符与逗号/句号/顿号除外）
 BANNED_PUNCT = set("！？!?；;：:…—–~～·﹏《》〈〉【】「」『』〔〕`´¨^&*#$@+=|\\/")
 
+# 成对符号（引号/括号/花括号）——未成对时告警
+PAIR_PAIRS = [("（", "）"), ("(", ")"), ("{", "}"), ("“", "”"), ("‘", "’"), ('"', '"')]
+
+# 衔接/推测性表述，出现即提示
+STYLE_WARN_RE = re.compile(r"接着|可以看到|可以观察")
+
+# 景别类描述词：前面必须有“的”（如“XXX的远景”），长词在前避免子串误匹配
+SHOT_DE_RE = re.compile(r"大远景|极远景|大全景|中近景|大特写|小全景|全景|中景|近景|特写|远景|后景")
+
 
 class Issue:
     __slots__ = ("start", "end", "level", "kind", "block_idx", "message")
@@ -196,7 +205,7 @@ def _all_time_spans(text):
 
 
 def check_punctuation(text, excluded):
-    """除逗号/句号外，其余标点告警。excluded 为局部区间列表（标签、时间等）"""
+    """标点检查：非法标点 + 连续逗号/句号/顿号。excluded 为局部区间列表（标签、时间等）"""
     issues = []
     excl = sorted(excluded)
     i = 0
@@ -206,16 +215,69 @@ def check_punctuation(text, excluded):
         if i < len(excl) and excl[i][0] <= idx < excl[i][1]:
             continue
         if ch in BANNED_PUNCT:
-            issues.append((idx, idx + 1, "标点", f"不允许出现“{ch}”，仅允许逗号“，”和句号“。”"))
+            issues.append((idx, idx + 1, "标点", f"不允许出现“{ch}”，仅允许逗号“，”、句号“。”和顿号“、”"))
+    # 连续标点：两个及以上相邻的逗号/句号/顿号视为非法用法
+    for m in re.finditer(r"[，。、]{2,}", text):
+        s = m.start()
+        if any(a <= s < b for a, b in excl):
+            continue
+        issues.append((m.start(), m.end(), "标点", f"出现连续标点“{m.group(0)}”，逗号/句号/顿号不应连用"))
+    return issues
+
+
+def check_pairing(text, excluded):
+    """成对符号（引号/括号/花括号等）验证：未成对则告警。返回 [(start, end, kind, msg)]"""
+    issues = []
+    excl = sorted(excluded)
+
+    def inside(pos):
+        for a, b in excl:
+            if a <= pos < b:
+                return True
+        return False
+
+    for op, cl in PAIR_PAIRS:
+        stack = []
+        for idx, ch in enumerate(text):
+            if inside(idx):
+                continue
+            if ch == op:
+                if op == cl and stack and text[stack[-1]] == op:
+                    stack.pop()  # 同字符成对（如 "）：闭合
+                else:
+                    stack.append(idx)
+            elif ch == cl:
+                if stack and text[stack[-1]] == op:
+                    stack.pop()
+                else:
+                    issues.append((idx, idx + 1, "成对", f"“{cl}”未成对（缺少对应的“{op}”）"))
+        for idx in stack:
+            issues.append((idx, idx + 1, "成对", f"“{op}”未成对（缺少对应的“{cl}”）"))
+    return issues
+
+
+def check_style_words(text):
+    """衔接/推测类表述（接着/可以看到/可以观察）提示。返回 [(start, end, msg)]"""
+    return [(m.start(), m.end(), f"出现“{m.group(0)}”，建议避免衔接/推测性表述，直接描述画面")
+            for m in STYLE_WARN_RE.finditer(text)]
+
+
+def check_shot_de(text):
+    """景别描述前必须有“的”，如“XXX的远景”。返回 [(start, end, msg)]"""
+    issues = []
+    for m in SHOT_DE_RE.finditer(text):
+        if m.start() == 0 or text[m.start() - 1] != "的":
+            issues.append((m.start(), m.end(), f"“{m.group(0)}”前缺“的”，应为“XXX的{m.group(0)}”"))
     return issues
 
 
 def check_lr(text):
     """左/右 参照系检查。返回 [(start, end, level, msg)]
     只对“位置类”左右（后接 侧/边/方/部/角/上/下/里/中 等）检查参照系：
-      前置限定词为 画面/镜头/屏幕/图/偏 → 画面左右，正确，不提示；
+      前置限定词为 画面/镜头/图/偏 → 画面左右，正确，不提示；
       前置限定词为 人物/主体/某类人    → 人物左右，正确，不提示；
-      均无 → 参照系歧义，告警。"""
+      “屏幕左/右”参照系不明（画面内屏幕与画面临近方向易混），与其余
+      无前置限定词的情况一样告警。"""
     issues = []
     for m in re.finditer(r"[左右]", text):
         s = m.start()
@@ -223,12 +285,40 @@ def check_lr(text):
         if not re.match(r"[侧边方部角上下里中]", nxt):
             continue  # 非位置类（腿/臂/摇/转等）不检查
         pre = text[max(0, s - 3):s].rstrip("的")
-        if re.search(r"画面|镜头|屏幕|图|偏", pre):
+        if re.search(r"画面|镜头|图|偏", pre):
             continue  # 画面左右，正确
         if re.search(r"(人物|主体|工人|司机|学生|女孩|男孩|老人|男人|女人|顾客|行人|演员|角色|其|他|她|人)$", pre):
             continue  # 人物左右，正确
         issues.append((s, s + 1, "error", "“左/右”参照系不明确：是“画面左/右”还是“人物/主体左/右”？建议写明“画面的左侧”或“位于人物左侧”"))
     return issues
+
+
+def check_screen(text):
+    """“屏幕”用词告警：视频描述中取景区域应称“画面”。返回 [(start, end, level, msg)]
+    与 check_lr 去重：屏幕+位置类左右（如“屏幕左侧”“屏幕的右边”）时，
+    参照系告警更具体，这里不重复提示。"""
+    issues = []
+    for m in re.finditer(r"屏幕", text):
+        tail = text[m.end():m.end() + 3].lstrip("的")
+        if re.match(r"[左右][侧边方部角上下里中]", tail):
+            continue  # 由 check_lr 的“屏幕左/右”参照系告警覆盖
+        issues.append((m.start(), m.end(), "error",
+                       "出现“屏幕”，建议改为“画面”（视频描述用“画面”描述取景区域，“屏幕”易与设备/界面混淆）"))
+    return issues
+
+
+def quality_spans(text):
+    """返回“以‘视听质量’开头的句子”区间列表 [(start, end)]。
+    句子起点 = 文本开头或句末标点（。？！!；）之后的“视听质量”；
+    终点 = 该句下一个“。”或文末。"""
+    spans = []
+    for m in re.finditer(r"(?:^|[。？！!；])\s*视听质量", text):
+        start = m.end() - len("视听质量")
+        seg = text[start:]
+        j = seg.find("。")
+        end = start + j + 1 if j != -1 else len(text)
+        spans.append((start, end))
+    return spans
 
 
 def key_of_block(b):
@@ -237,10 +327,15 @@ def key_of_block(b):
 
 
 def analyze_text(text):
-    """对全文做完整解析：返回 (parts, blocks, issues)。
-    在此标记 <ID_x> 首次出现并执行五要素检查。"""
+    """对全文做完整解析：返回 (parts, blocks, issues, memory)。
+    在此标记 <ID_x> 首次出现并执行五要素检查；ENV 句检查景别；
+    “视听质量”开头的句子整体标记为 quality 部分。"""
     parts = parse_parts(text)
     blocks = build_blocks(text)
+    # “视听质量”开头的句子整体标识（类似括号/引号等部分；按句子边界识别）
+    for s, e in quality_spans(text):
+        parts.append((s, e, "quality"))
+    parts.sort(key=lambda x: x[0])
     time_spans = _all_time_spans(text)
     issues = []
     seen_ids = set()
@@ -265,9 +360,24 @@ def analyze_text(text):
                 if not found[e]:
                     issues.append(Issue(b.start + mt.start(), b.start + mt.end(), "error", "缺失", bi + 1,
                                         f"{mt.group(0)}首次出现：未识别到【{e}】，请按【视角】【主体】【景别】【位置】【朝向】顺序补全"))
+        # ENV 句：检查【景别】（全景/特写等）
+        if b.kind == "ENV" and not SHOT_RE.search(seg):
+            mt = TAG_RE.search(seg)
+            if mt:
+                issues.append(Issue(b.start + mt.start(), b.start + mt.end(), "error", "缺失", bi + 1,
+                                    f"{b.tag_text}环境句：未识别到【景别】（如全景/特写/中景/近景等），请补全"))
         # 标点
         for s, e, kind, msg in check_punctuation(seg, excl):
             issues.append(Issue(b.start + s, b.start + e, "error", kind, bi + 1, f"句{bi + 1}: {msg}"))
+        # 成对符号（引号/括号/花括号）
+        for s, e, kind, msg in check_pairing(seg, excl):
+            issues.append(Issue(b.start + s, b.start + e, "error", kind, bi + 1, f"句{bi + 1}: {msg}"))
+        # 衔接/推测性表述
+        for s, e, msg in check_style_words(seg):
+            issues.append(Issue(b.start + s, b.start + e, "hint", "用语", bi + 1, f"句{bi + 1}: {msg}"))
+        # 景别描述前必须有“的”
+        for s, e, msg in check_shot_de(seg):
+            issues.append(Issue(b.start + s, b.start + e, "error", "格式", bi + 1, f"句{bi + 1}: {msg}"))
         # 时间精度
         for s, e, msg in check_time_precision(seg):
             issues.append(Issue(b.start + s, b.start + e, "error", "时间", bi + 1, f"句{bi + 1}: {msg}"))
@@ -277,24 +387,68 @@ def analyze_text(text):
         # 左/右参照系
         for s, e, lvl, msg in check_lr(seg):
             issues.append(Issue(b.start + s, b.start + e, lvl, "参照", bi + 1, f"句{bi + 1}: {msg}"))
-    return parts, blocks, issues
+        # “屏幕”用词
+        for s, e, lvl, msg in check_screen(seg):
+            issues.append(Issue(b.start + s, b.start + e, lvl, "用语", bi + 1, f"句{bi + 1}: {msg}"))
+    # 标签记忆：每个 <ID_x> 按首次出现识别五要素；未完整时允许后续出现补齐，
+    # 一旦五个元素都识别到即锁定，后面不再覆盖。
+    memory = {}
+    for b in blocks:
+        if b.kind != "ID":
+            continue
+        seg = b.text
+        for mt in TAG_RE.finditer(seg):
+            if mt.group("kind") != "ID":
+                continue
+            tag = mt.group(0)
+            cur = memory.get(tag)
+            if cur is not None and all(cur.values()):
+                continue  # 已识别完整，后面不再覆盖
+            found = check_id_elements(seg)
+            if cur is None:
+                memory[tag] = {e: found.get(e) for e in ELEMENTS}
+            else:
+                for e in ELEMENTS:
+                    if not cur[e] and found.get(e):
+                        cur[e] = found.get(e)
+    return parts, blocks, issues, memory
 
 
 # ============================================================
 #  高亮与演示（GUI 复用）
 # ============================================================
 
+# 不同 <ID_n> 的配色（背景/前景成对，循环使用；色相拉开便于区分）
+ID_PALETTE = [
+    ("#FFF3A6", "#8B6914"),  # 黄
+    ("#FFD9A8", "#8A4A10"),  # 橙
+    ("#C9F2C0", "#2E6B2E"),  # 绿
+    ("#C9E4FF", "#1F4E8C"),  # 蓝
+    ("#FFD9E0", "#8C2E45"),  # 粉
+]
+
+def _id_tag_name(widget, num):
+    """给 <ID_n> 配置标签（懒配置，重复调用幂等）。"""
+    name = f"id_tag_{num}"
+    bg, fg = ID_PALETTE[(num - 1) % len(ID_PALETTE)]
+    widget.tag_configure(name, background=bg, foreground=fg,
+                         font=("Microsoft YaHei UI", 12, "bold"),
+                         borderwidth=0, relief="flat")
+    return name
+
+
 def configure_tags(widget):
-    # 结构标签：带边框的“胶囊”样式（tkinter 不支持真圆角，用浮雕边框近似）
     widget.tag_configure("id_tag", background="#FFF3A6", foreground="#8B6914",
-                         font=("Microsoft YaHei UI", 12, "bold"), borderwidth=2, relief="ridge")
+                         font=("Microsoft YaHei UI", 12, "bold"), borderwidth=0, relief="flat")
     widget.tag_configure("env_tag", background="#EBDCF8", foreground="#7A3FA0",
-                         font=("Microsoft YaHei UI", 12, "bold"), borderwidth=2, relief="ridge")
+                         font=("Microsoft YaHei UI", 12, "bold"), borderwidth=0, relief="flat")
+
     # 各部分：显式指定深色文字，避免系统选中白字叠加到色底上看不清
     widget.tag_configure("bg", background="#CFE5FF", foreground="#1A1A1A")
     widget.tag_configure("voice", background="#D3F0CF", foreground="#1A1A1A")
     widget.tag_configure("quote", background="#FFE0B3", foreground="#1A1A1A")
     widget.tag_configure("time", background="#D8F3E5", foreground="#0B6E4F", font=("Microsoft YaHei UI", 12, "bold"))
+    widget.tag_configure("quality", background="#F2E9DE", foreground="#6B4A2B")  # 视听质量句整体标识
     # 状态标签
     widget.tag_configure("current", background="#E3F0FF", foreground="#1A1A1A")
     widget.tag_configure("processed", foreground="#9A9A9A")
@@ -343,18 +497,33 @@ def plain_ranges(text, parts, b):
 
 def apply_highlights_to(widget, text, parts, blocks, issues, current_idx):
     """把解析结果刷到任意 Text 控件上（主编辑区与只读示例窗口共用）。"""
-    for tag in ("id_tag", "env_tag", "bg", "voice", "quote", "time",
+    for tag in ("id_tag", "env_tag", "bg", "voice", "quote", "time", "quality",
                 "current", "processed", "error", "hint", "chunk_editing"):
         widget.tag_remove(tag, "1.0", "end")
-    for m in TAG_RE.finditer(text):
-        tag = "id_tag" if m.group("kind") == "ID" else "env_tag"
-        widget.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+    for name in [n for n in widget.tag_names() if n.startswith("id_tag_")]:
+        widget.tag_remove(name, "1.0", "end")
+    # 1) “视听质量”句整体标识（先加，标签等可覆盖其上）
     for s, e, k in parts:
+        if k == "quality":
+            widget.tag_add("quality", f"1.0+{s}c", f"1.0+{e}c")
+    # 2) 结构标签：<ID_x> 按序号轻微配色，<ENV_x> 固定紫色
+    for m in TAG_RE.finditer(text):
+        if m.group("kind") == "ID":
+            tag = _id_tag_name(widget, int(m.group("num")))
+        else:
+            tag = "env_tag"
+        widget.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+    # 3) 其余部分（背景声/人声/文本/时间）
+    for s, e, k in parts:
+        if k == "quality":
+            continue
         widget.tag_add(k, f"1.0+{s}c", f"1.0+{e}c")
+    # 4) 问题
     for iss in issues:
         tag = "error" if iss.level == "error" else "hint"
         end = max(iss.end, iss.start + 1)
         widget.tag_add(tag, f"1.0+{iss.start}c", f"1.0+{end}c")
+    # 5) 当前块 / 已处理
     for i, b in enumerate(blocks):
         if b.done:
             for s, e in plain_ranges(text, parts, b):
@@ -362,6 +531,18 @@ def apply_highlights_to(widget, text, parts, blocks, issues, current_idx):
         elif i == current_idx:
             for s, e in plain_ranges(text, parts, b):
                 widget.tag_add("current", f"1.0+{s}c", f"1.0+{e}c")
+    # 5b) “视听质量”句整体被 quality 覆盖，当前/已处理状态仍要显示在其上方
+    for s, e, k in parts:
+        if k != "quality":
+            continue
+        for i, b in enumerate(blocks):
+            if b.start <= s and e <= b.end:
+                if b.done:
+                    widget.tag_add("processed", f"1.0+{s}c", f"1.0+{e}c")
+                elif i == current_idx:
+                    widget.tag_add("current", f"1.0+{s}c", f"1.0+{e}c")
+                break
+    # 6) 选中的“语块”
     try:
         sel = widget.tag_ranges("sel")
         if sel:
@@ -375,10 +556,13 @@ SAMPLE_TEXT = (
     "平拍一名<ID_1>穿着白色传统武术服成年男性的全景，位于画面中心，正面朝镜头。（中式器乐持续播放）"
     "{男子轻声说道}“准备开始”，从0.0s到1.2s。"
     "背景<ENV_1>是老式房屋前的室外区域全景，地面铺蓝色橡胶垫，画面顶部是锈蚀波纹屋顶。"
-    "从1.2s到2.8s，这名男性重心移到右腿，双臂缓慢画圆弧，镜头轻微右摇。"
+    "从1.2s到2.8s，这名男性重心移到右腿，，双臂缓慢画圆弧，镜头轻微右摇。"
     "在3.5s时，镜头保持静止。"
     "<ID_2>俯拍一辆叉车的中景，位于画面右侧，背面朝镜头，从8.1s到12.4s。"
     "<ID_3>拍一名工人在左侧从20s到22.5s？"
+    "视听质量整体清晰，画面无噪点。"
+    "接着，可以看到男子抬手，镜头轻微左摇。"
+    "他说“你好。"
 )
 
 # ============================================================
@@ -386,17 +570,18 @@ SAMPLE_TEXT = (
 # ============================================================
 
 LEGEND = [
-    ("id_tag",   "<ID_x> 镜头/分镜标签"),
-    ("env_tag",  "<ENV_x> 环境标签"),
+    ("id_tag",   "<ID_x> 镜头/分镜标签（不同序号轻微配色）"),
+    ("env_tag",  "<ENV_x> 环境标签（须含景别：全景/特写等）"),
     ("bg",       "（ ）背景声音描述"),
     ("voice",    "{ } 人类发声"),
     ("quote",    "“ ” 引号内文本内容"),
     ("time",     "时间：从X.Xs到X.Xs / 在X.Xs时"),
+    ("quality",  "以“视听质量”开头的句子（整体标识）"),
     ("current",  "当前编辑块（光标所在句）"),
     ("processed", "已处理块（文字变灰）"),
     ("chunk_editing", "选中的“语块”（正在编辑）"),
-    ("error",    "标点/时间/缺失等错误"),
-    ("hint",     "参照系等提示"),
+    ("error",    "标点/时间/缺失/成对符号/景别格式等错误"),
+    ("hint",     "参照系/衔接用语等提示"),
 ]
 
 
@@ -413,6 +598,7 @@ class App:
         self.blocks = []
         self.current_idx = 0
         self.done_keys = set()
+        self.tag_memory = {}   # {标签文本: 首次出现时识别的五要素}
         self._parse_job = None
         # 自动联想补全状态
         self._prev_text = ""
@@ -528,18 +714,30 @@ class App:
             "4. 每处理完一个句子点“完成当前块”(Ctrl+Enter)，\n"
             "   已处理块文字变灰，与未处理块区分；\n"
             "5. <ID_x> 首次出现时，逐项检查【视角】【主体】【景别】\n"
-            "   【位置】【朝向】，缺失会提示；\n"
-            "6. “画面左/右侧”“人物左侧”视为正确；若只写“左侧/\n"
-            "   右侧”参照系不明，会提示补全；\n"
+            "   【位置】【朝向】，缺失会提示；识别结果会被记住，\n"
+            "   未完整时后续出现会补齐，完整后不再覆盖；\n"
+            "   光标放到再次出现的同一标签上（含紧贴前后），\n"
+            "   右侧即显示记忆的元素；若当前句子只有一个标签，\n"
+            "   光标落在该句任意位置都会显示；<ENV_x> 环境句须含\n"
+            "   【景别】（全景/特写/中景等），缺失也会提示；\n"
+            "   不同 <ID_x> 序号有明显配色区分；\n"
+            "6. “画面左/右侧”“人物左侧”视为正确；“屏幕左/右”与\n"
+            "   只写“左侧/右侧”一样参照系不明，会提示补全；\n"
             "7. 时间精确到小数点后一位：区间“从X.Xs到X.Xs”、\n"
             "   时间点“在X.Xs时”均会高亮并校验；数字与 s、数字与\n"
             "   汉字之间允许空格（数字内部、数字与小数点处不允许）；\n"
-            "8. 合法标点：逗号、句号、顿号；其余标点会告警并标红。\n"
-            "9. 输入“<”弹出标签联想（↑↓选择，回车/Tab 确认，\n"
-            "   Esc 关闭）；选择后自动补全标签并在标签前后补空格；\n"
-            "10. 输入“从”弹出时间模板“从 s到 s”，选择后光标\n"
+            "8. 合法标点：逗号、句号、顿号；其余标点告警标红，\n"
+            "   连续两个及以上逗号/句号/顿号也会告警；\n"
+            "   引号/括号/花括号须成对，未成对告警；\n"
+            "9. 以“视听质量”开头的句子整体加底色标识；\n"
+            "10. 输入“<”弹出标签联想（↑↓选择，回车/Tab 确认，\n"
+            "    Esc 关闭）；输入数字同样会唤起标签联想（时间数值\n"
+            "    输入中不打扰）；选择后自动补全标签并在标签前后补空格；\n"
+            "11. 输入“从”弹出时间模板“从 s到 s”，选择后光标\n"
             "    停在“从”后；输入“在”弹出模板“在 s时”，选择后\n"
-            "    光标停在“在”后，便于直接填写时间。\n\n"
+            "    光标停在“在”后，便于直接填写时间；\n"
+            "12. “接着/可以看到/可以观察”等衔接推测词会提示；\n"
+            "    景别词（远景/全景/特写等）前必须带“的”（XXX的远景）。\n\n"
             "“示例（只读）”在独立只读窗口中演示，不影响你的文本。\n"
             "“保存”会把当前文本与处理进度存到本地 .json。"
         )
@@ -560,6 +758,7 @@ class App:
         m = {
             "id_tag": "#FFF3A6", "env_tag": "#EBDCF8", "bg": "#CFE5FF",
             "voice": "#D3F0CF", "quote": "#FFE0B3", "time": "#D8F3E5",
+            "quality": "#F2E9DE",
             "current": "#E3F0FF", "processed": "#F2F2F2", "chunk_editing": "#FFF9C4",
             "error": "#FFC9C9", "hint": "#FFF2CC",
         }
@@ -573,7 +772,9 @@ class App:
         text = self.text.get("1.0", "end-1c")
         self.raw_text = text
         self._prev_text = text
-        self.parts, self.blocks, self.issues = analyze_text(text)
+        self.parts, self.blocks, self.issues, memory = analyze_text(text)
+        # 标签记忆：首次出现识别到的五要素按标签名记住（完整后锁定）
+        self.tag_memory = memory
         # 保留已完成状态（按句子内容）
         for b in self.blocks:
             if key_of_block(b) in self.done_keys:
@@ -595,6 +796,7 @@ class App:
     def _on_key(self, event):
         self._on_selection()
         self.update_current_from_caret()
+        self._refresh_current_panel()
         self._schedule_parse()
         # 自动联想：检测刚输入的字符
         ch = self._detect_typed_char()
@@ -604,15 +806,40 @@ class App:
             self._show_time_suggestions()
         elif ch == "在":
             self._show_za_suggestions()
+        elif ch and ch.isdigit():
+            # 数字也触发标签联想（避免在时间数值中输入时打扰：紧接数字/小数点/s/时间词时不触发）
+            try:
+                prev = self.text.get("insert-2c", "insert-1c")
+            except tk.TclError:
+                prev = ""
+            if not prev or prev not in "0123456789.s从到时至在":
+                self._show_tag_suggestions()
+            elif self._ac_active():
+                self._ac_close()
         elif self._ac_active() and ch and ch not in ("<", "从", "在"):
             self._ac_close()
         return None
 
+    def _char_before_insert(self):
+        try:
+            return self.text.get("insert-1c", "insert")
+        except tk.TclError:
+            return ""
+
     def _on_click(self, event=None):
         self._on_selection()
         self.update_current_from_caret()
+        self._refresh_current_panel()
         if self._ac_active():
             self._ac_close()
+
+    def _tag_under_cursor(self):
+        """返回光标处（含紧贴标签前/后）的标签文本，不在标签上返回 None。"""
+        pos = self._tk_index_to_offset("insert")
+        for m in TAG_RE.finditer(self.raw_text):
+            if m.start() <= pos <= m.end():
+                return m.group(0)
+        return None
 
     def _on_selection(self, event=None):
         """把当前选择范围加上“语块”高亮；拖选过程中也会被持续调用。"""
@@ -927,10 +1154,33 @@ class App:
             return
         b = self.blocks[self.current_idx]
         tag = b.tag_text if b.tag_text else "(无标签)"
+        # —— 标签记忆展示：单标签句整句显示；多标签句须光标在标签上（含前后）才显示 ——
+        block_tags = [m.group(0) for m in TAG_RE.finditer(b.text)]
+        show_tag = block_tags[0] if len(block_tags) == 1 else self._tag_under_cursor()
+        mem = self.tag_memory.get(show_tag) if show_tag else None
+        if mem is not None:
+            if len(block_tags) == 1:
+                title = f"标签 {show_tag}（记忆自首次出现）"
+            else:
+                title = f"标签 {show_tag}（记忆自首次出现）"
+            self.cur_info.config(text=title)
+            for e in ELEMENTS:
+                v = clean_show(mem.get(e))
+                if v:
+                    self.check_rows[e].config(text=f"✓ {v}", foreground="#1a7f37")
+                else:
+                    self.check_rows[e].config(text="✗ 未识别", foreground="#c00000")
+            missing = [e for e in ELEMENTS if not mem.get(e)]
+            note = "✓ 五要素齐全（记忆自首次出现）" if not missing else f"记忆缺少：{'、'.join(missing)}"
+            self.cur_note.config(text=note, foreground=("#1a7f37" if not missing else "#c00000"))
+            self._panel_part_summary(b)
+            return
         if b.checklist is not None:
             first_txt = "，含 ID 首次出现，五要素检查"
         elif b.kind == "ID":
             first_txt = "，ID 非首次（已读取五要素）"
+        elif b.kind == "ENV":
+            first_txt = "，ENV 环境句（检查景别）"
         else:
             first_txt = ""
         self.cur_info.config(text=f"当前块：{tag}{first_txt}")
@@ -955,15 +1205,34 @@ class App:
                     else:
                         self.check_rows[e].config(text="—", foreground="#999999")
                 self.cur_note.config(text="ID 非首次出现：已读取五要素（仅供参考）", foreground="#666666")
+            elif b.kind == "ENV":
+                # ENV 句：检查【景别】（全景/特写等）
+                mshot = SHOT_RE.search(b.text)
+                v = mshot.group(0) if mshot else None
+                for e in ELEMENTS:
+                    if e == "景别":
+                        if v:
+                            self.check_rows[e].config(text=f"✓ {v}", foreground="#1a7f37")
+                        else:
+                            self.check_rows[e].config(text="✗ 未识别", foreground="#c00000")
+                    else:
+                        self.check_rows[e].config(text="—", foreground="#999999")
+                self.cur_note.config(
+                    text=(f"✓ ENV 景别：{v}" if v else "ENV 环境句：缺少【景别】（如全景/特写/中景/近景）"),
+                    foreground=("#1a7f37" if v else "#c00000"))
             else:
                 for e in ELEMENTS:
                     self.check_rows[e].config(text="—", foreground="#000000")
-                if b.kind == "ENV":
-                    self.cur_note.config(text="ENV 环境句：不进行 ID 五要素检查", foreground="#666666")
+                qs = quality_spans(self.raw_text)
+                if any(s >= b.start and e <= b.end for s, e in qs):
+                    self.cur_note.config(text="含以“视听质量”开头的句子：已整体标识", foreground="#6B4A2B")
                 else:
                     self.cur_note.config(text="无标签句子：默认处理单元（以句号切分）", foreground="#666666")
         # 各部分统计
-        cnt = {"背景声": 0, "人声": 0, "文本": 0, "时间": 0}
+        self._panel_part_summary(b)
+
+    def _panel_part_summary(self, b):
+        cnt = {"背景声": 0, "人声": 0, "文本": 0, "时间": 0, "视听质量": 0}
         for s, e, k in self.parts:
             if b.start <= s and e <= b.end:
                 if k == "bg":
@@ -974,6 +1243,8 @@ class App:
                     cnt["文本"] += 1
                 elif k == "time":
                     cnt["时间"] += 1
+                elif k == "quality":
+                    cnt["视听质量"] += 1
         self.part_summary.config(text="本句部分：" + "  ".join(f"{k}×{v}" for k, v in cnt.items() if v))
 
     def _set_status(self, msg):
@@ -1007,8 +1278,9 @@ class App:
         configure_tags(box)
         box.insert("1.0", SAMPLE_TEXT)
         box.config(state="disabled")
-        parts, blocks, issues = analyze_text(SAMPLE_TEXT)
+        parts, blocks, issues, _ = analyze_text(SAMPLE_TEXT)
         apply_highlights_to(box, SAMPLE_TEXT, parts, blocks, issues, 0)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
         # 问题列表（只读）
         ttk.Label(win, text="检查结果：", padding=(6, 0)).pack(anchor=tk.W)
         lst = tk.Listbox(win, font=("Microsoft YaHei UI", 10), height=8)
@@ -1025,15 +1297,18 @@ class App:
 # ============================================================
 
 def self_test():
-    parts, blocks, issues = analyze_text(SAMPLE_TEXT)
+    parts, blocks, issues, memory = analyze_text(SAMPLE_TEXT)
     print("==== 块列表（按句号切分）====")
     for i, b in enumerate(blocks, 1):
         print(f"{i}. [{b.tag_text or '无标签'}] 首次={b.first} 文本={b.text[:22]!r}")
 
-    print("\n==== 五要素 ====")
+    print("\n==== 五要素（首次出现）====")
     for b in blocks:
         if b.checklist:
             print(f"{b.tag_text}: " + "  ".join(f"{k}={clean_show(v)!r}" for k, v in b.checklist.items()))
+    print("\n==== 标签记忆 ====")
+    for tag, d in memory.items():
+        print(f"{tag}: " + "  ".join(f"{k}={clean_show(v)!r}" for k, v in d.items()))
 
     print("\n==== 问题 ====")
     for iss in issues:
@@ -1050,12 +1325,32 @@ def self_test():
     assert not id3.checklist["朝向"], "ID_3 朝向不应被识别"
     assert id3.checklist["主体"], "ID_3 主体应被识别"
     errs = [i.message for i in issues if i.level == "error"]
+    hints = [i.message for i in issues if i.level == "hint"]
     assert any("？" in m for m in errs), "应有问号标点告警"
     assert any("20s" in m for m in errs), "应有时间精度告警"
+    assert any("连续标点" in m for m in errs), "应有连续标点告警"
+    assert any("未成对" in m for m in errs), "应有成对符号告警"
+    assert any("前缺“的”" in m for m in errs), "应有景别前缺“的”告警"
     assert any("参照系不明确" in m for m in errs), "应有参照系歧义告警"
+    assert any("接着" in m or "可以看到" in m for m in hints), "应有衔接词提示"
     # 时间点“在X.Xs时”应被识别为时间部分（高亮）
     time_parts = [SAMPLE_TEXT[s:e] for s, e, k in parts if k == "time"]
     assert any("在3.5s时" in seg for seg in time_parts), "时间点“在3.5s时”应被识别为时间"
+    # “视听质量”开头的句子整体标识
+    assert any(k == "quality" for _, _, k in parts), "应有“视听质量”句标识"
+    # ENV 句景别：无景别告警，有景别不告警
+    _, _, env_issues, _ = analyze_text("背景<ENV_1>是室外区域。")
+    assert any("ENV" in i.message and "景别" in i.message for i in env_issues), "ENV 缺景别应告警"
+    _, _, env_ok_issues, _ = analyze_text("背景<ENV_1>是室外区域全景。")
+    assert not any("景别" in i.message for i in env_ok_issues), "ENV 含景别不应告警"
+    # “屏幕”左右参照系告警
+    assert any("参照系" in m for _, _, _, m in check_lr("位于屏幕左侧")), "屏幕左右应告警"
+    assert not any("参照系" in m for _, _, _, m in check_lr("位于画面左侧")), "画面左右不应告警"
+    # “屏幕”用词告警（“屏幕左侧”交给参照系，不重复；“屏幕顶部”单独告警）
+    assert any("画面" in m and "屏幕" in m for _, _, _, m in check_screen("屏幕顶部有裂缝")), "屏幕用词应告警"
+    assert not any("屏幕" in m for _, _, _, m in check_screen("位于屏幕左侧")), "屏幕左/右不应重复告警"
+    # 连续标点
+    assert any("连续标点" in m for _, _, _, m in check_punctuation("画面，，细节", [])), "连续标点应告警"
     # 块数量应多于1（句号切分生效）
     assert len(blocks) >= 8, f"应按句号切分出多个块，实际 {len(blocks)}"
     print("\n自测通过 ✔")
