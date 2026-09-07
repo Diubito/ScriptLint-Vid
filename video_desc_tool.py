@@ -417,9 +417,6 @@ def analyze_text(text):
         # 标点
         for s, e, kind, msg in check_punctuation(seg, excl):
             issues.append(Issue(b.start + s, b.start + e, "error", kind, bi + 1, f"句{bi + 1}: {msg}"))
-        # 成对符号（引号/括号/花括号）
-        for s, e, kind, msg in check_pairing(seg, excl):
-            issues.append(Issue(b.start + s, b.start + e, "error", kind, bi + 1, f"句{bi + 1}: {msg}"))
         # 衔接/推测性表述
         for s, e, msg in check_style_words(seg):
             issues.append(Issue(b.start + s, b.start + e, "hint", "用语", bi + 1, f"句{bi + 1}: {msg}"))
@@ -450,6 +447,16 @@ def analyze_text(text):
         # 换行符弱提示
         for s, e, msg in check_newline(seg):
             issues.append(Issue(b.start + s, b.start + e, "hint", "换行", bi + 1, f"句{bi + 1}: {msg}"))
+    # 成对符号（引号/括号/花括号）：跨块验证。句号切块会把闭合符（如“）”）
+    # 甩到下一块，按块检查会误报“未成对”，故在全文层面对齐匹配。
+    all_tags = [(m.start(), m.end()) for m in TAG_RE.finditer(text)]
+    for s, e, kind, msg in check_pairing(text, time_spans + all_tags):
+        bi = 1
+        for k, b in enumerate(blocks):
+            if b.start <= s < b.end:
+                bi = k + 1
+                break
+        issues.append(Issue(s, e, "error", kind, bi, f"句{bi}: {msg}"))
     # 标签记忆：每个 <ID_x> 按首次出现识别五要素；未完整时允许后续出现补齐，
     # 一旦五个元素都识别到即锁定，后面不再覆盖。
     memory = {}
@@ -881,12 +888,12 @@ class App:
         elif ch == "在":
             self._show_za_suggestions()
         elif ch and ch.isdigit():
-            # 数字也触发标签联想（避免在时间数值中输入时打扰：紧接数字/小数点/s/时间词时不触发）
-            try:
-                prev = self.text.get("insert-2c", "insert-1c")
-            except tk.TclError:
-                prev = ""
-            if not prev or prev not in "0123456789.s从到时至在":
+            # 时间戳联想模板的智能跳格（“从X.Xs到X.Xs，”自动补 s 并跳到“到”/“，”后）
+            if self._time_skip():
+                self._ac_close()
+            elif not (self.text.get("insert-2c", "insert-1c") or
+                      self.text.get("insert-2c", "insert-1c") in "0123456789.s从到时至在"):
+                # 数字也触发标签联想（避免在时间数值中输入时打扰：紧接数字/小数点/s/时间词时不触发）
                 self._show_tag_suggestions(digit=ch)
             elif self._ac_active():
                 self._ac_close()
@@ -975,9 +982,39 @@ class App:
         return items
 
     def _time_candidates(self):
-        """时间模板：从 s到 s（选择后光标停在“从”后）。"""
-        tmpl = "从 s到 s"
+        """时间模板：从 s到 s，（选择后光标停在“从”后；输入“数字.数字”后自动跳格）。"""
+        tmpl = "从 s到 s，"
         return [(tmpl, tmpl, 1, False)]
+
+    def _time_skip(self):
+        """时间戳联想模板的智能跳格：输入构成“从X.X”或“到X.X”（小数点后已输入一个字符）时，
+        跳过模板占位的空格与“s”，并把光标跳到“到”后（从段）或“，”后（到段）。
+        仅当光标后确为模板结构时才跳，避免干扰手动输入。返回是否发生了跳格。"""
+        before = self.text.get("1.0", "insert")
+        m = re.search(r"(从|到)\s*(\d)\.(\d)$", before)
+        if not m:
+            return False
+        # 删除光标后的占位空格（模板“从 s到 s，”中的空格）
+        while self.text.get("insert", "insert+1c") == " ":
+            self.text.delete("insert", "insert+1c")
+        # “s”就位（模板保留）或缺失则补上
+        if self.text.get("insert", "insert+1c") == "s":
+            self.text.mark_set("insert", "insert+1c")
+        else:
+            self.text.insert("insert", "s")
+        # 光标现已在“s”后，按段跳格
+        if m.group(1) == "从":
+            if self.text.get("insert", "insert+1c") == "到":
+                self.text.mark_set("insert", "insert+1c")
+                if self.text.get("insert", "insert+1c") == " ":
+                    self.text.delete("insert", "insert+1c")
+                return True
+            return False
+        else:
+            if self.text.get("insert", "insert+1c") == "，":
+                self.text.mark_set("insert", "insert+1c")
+                return True
+            return False
 
     def _za_candidates(self):
         """时间点模板：在 s时，（选择后光标停在“在”后）。"""
