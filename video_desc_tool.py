@@ -697,8 +697,11 @@ class App:
         root.bind("<F5>", lambda e: self.parse_all())
         root.bind("<Control-s>", lambda e: self.save())
         root.bind("<Control-Return>", lambda e: self.mark_done())
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._set_status("就绪。粘贴文本后自动解析；光标所在的句子即当前编辑块；选中文字即变为语块。")
+        # 启动时自动恢复上次会话
+        self.root.after(200, self._auto_load)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -868,6 +871,11 @@ class App:
         n_e = sum(1 for i in self.issues if i.level == "error")
         n_h = sum(1 for i in self.issues if i.level == "hint")
         self._set_status(f"已解析：{len(self.blocks)} 个句子块，错误 {n_e} 条，提示 {n_h} 条。")
+        # 内容稳定后自动保存，重启不丢失
+        try:
+            self.save(silent=True)
+        except Exception:
+            pass
 
     def _schedule_parse(self):
         if self._parse_job:
@@ -1301,7 +1309,7 @@ class App:
         self.issue_list.delete(0, tk.END)
         for i, iss in enumerate(self.issues):
             sym = "⚠" if iss.level == "error" else "ℹ"
-            fg = "#c00000" if iss.level == "error" else "#b36b00"
+            fg = "#c00000" if iss.level == "error" else "#555555"
             label = f"{sym} 块{iss.block_idx} {iss.message}"
             self.issue_list.insert(tk.END, label)
             self.issue_list.itemconfig(i, foreground=fg)
@@ -1424,18 +1432,50 @@ class App:
         self.status.config(text=msg)
 
     # ---------- 文件与示例 ----------
-    def save(self):
+    def save(self, silent=False):
         data = {
             "text": self.raw_text,
-            "done": sorted(self.done_keys),
+            # done 键为 ("s", 块文本)，仅存文本部分（可 JSON 序列化）
+            "done": sorted(k[1] for k in self.done_keys),
         }
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_desc_session.json")
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self._set_status(f"已保存到 {path}")
+            if not silent:
+                self._set_status(f"已保存到 {path}")
         except Exception as e:
-            messagebox.showerror("保存失败", str(e))
+            if not silent:
+                messagebox.showerror("保存失败", str(e))
+
+    def _auto_load(self):
+        """启动时自动恢复上次保存的文本与处理进度。"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_desc_session.json")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        txt = data.get("text", "")
+        if not txt:
+            return
+        self.done_keys = set()
+        for item in data.get("done", []):
+            if isinstance(item, str):
+                self.done_keys.add(("s", item))
+            elif isinstance(item, list) and len(item) == 2 and item[0] == "s":
+                self.done_keys.add(("s", item[1]))
+        self.text.insert("1.0", txt)
+        self.parse_all()
+        self._set_status(f"已自动恢复上次会话（{len(self.blocks)} 个句子块）。")
+
+    def _on_close(self):
+        try:
+            self.save(silent=True)
+        finally:
+            self.root.destroy()
 
     def show_sample(self):
         """示例只读演示窗口：不进入主编辑区，不可编辑。"""
@@ -1460,7 +1500,7 @@ class App:
         lst.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
         for iss in issues:
             sym = "⚠" if iss.level == "error" else "ℹ"
-            fg = "#c00000" if iss.level == "error" else "#b36b00"
+            fg = "#c00000" if iss.level == "error" else "#555555"
             lst.insert(tk.END, f"{sym} 句{iss.block_idx} {iss.message}")
             lst.itemconfig(tk.END, foreground=fg)
 
