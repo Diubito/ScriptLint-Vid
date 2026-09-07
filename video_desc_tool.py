@@ -490,10 +490,18 @@ ID_PALETTE = [
 def _id_tag_name(widget, num):
     """给 <ID_n> 配置标签（懒配置，重复调用幂等）。"""
     name = f"id_tag_{num}"
-    bg, fg = ID_PALETTE[(num - 1) % len(ID_PALETTE)]
-    widget.tag_configure(name, background=bg, foreground=fg,
-                         font=("Microsoft YaHei UI", 12, "bold"),
-                         borderwidth=0, relief="flat")
+    if name not in widget.tag_names():
+        bg, fg = ID_PALETTE[(num - 1) % len(ID_PALETTE)]
+        widget.tag_configure(name, background=bg, foreground=fg,
+                             font=("Microsoft YaHei UI", 12, "bold"),
+                             borderwidth=0, relief="flat")
+        # 动态标签创建时优先级最高，会盖住选中“语块”高亮（选中时标签不变色）；
+        # 首次创建后把它降到 chunk_editing 之下（仍在 current 之上），
+        # 这样选中文本时标签区域同样会显示选中变色
+        try:
+            widget.tag_lower(name, "chunk_editing")
+        except tk.TclError:
+            pass
     return name
 
 
@@ -879,7 +887,7 @@ class App:
             except tk.TclError:
                 prev = ""
             if not prev or prev not in "0123456789.s从到时至在":
-                self._show_tag_suggestions()
+                self._show_tag_suggestions(digit=ch)
             elif self._ac_active():
                 self._ac_close()
         elif self._ac_active() and ch and ch not in ("<", "从", "在"):
@@ -939,8 +947,9 @@ class App:
         except tk.TclError:
             return ""
 
-    def _tag_candidates(self):
-        """标签候选项：文档中已使用的 <ID_x>/<ENV_x> + 各新建一个序号。"""
+    def _tag_candidates(self, digit=None):
+        """标签候选项：输入数字时对应序号的 <ID_x>/<ENV_x> 排最前（优先联想），
+        其后为文档中已用序号 + 各新建一个序号。"""
         text = self.text.get("1.0", "end-1c")
         used = {"ID": set(), "ENV": set()}
         for m in TAG_RE.finditer(text):
@@ -954,6 +963,10 @@ class App:
                 seen.add(key)
                 items.append((key + suffix, key, len(key), True))
 
+        if digit and digit.isdigit():
+            d = int(digit)
+            for kind in ("ID", "ENV"):
+                add(kind, d)
         for kind in ("ID", "ENV"):
             for n in sorted(used[kind]):
                 add(kind, n)
@@ -978,9 +991,9 @@ class App:
             bx, by, bw, bh = 10, 10, 0, 0
         return self.text.winfo_rootx() + bx, self.text.winfo_rooty() + by + bh
 
-    def _show_tag_suggestions(self):
+    def _show_tag_suggestions(self, digit=None):
         self._ac_start_idx = self.text.index("insert-1c")
-        self._ac_show(self._tag_candidates())
+        self._ac_show(self._tag_candidates(digit))
 
     def _show_time_suggestions(self):
         self._ac_start_idx = self.text.index("insert-1c")
