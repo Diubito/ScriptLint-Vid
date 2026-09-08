@@ -40,6 +40,8 @@ except Exception:
 # ============================================================
 
 TAG_RE = re.compile(r"<(?P<kind>ID|ENV)_(?P<num>\d+)>")
+# 疑似标签（不完整/含空格/跨行）：<ID_x 缺 “>”、<ID 1> 中间有空格、<ID_6 后紧跟换行
+BAD_TAG_RE = re.compile(r"<(?P<kind>ID|ENV)(?P<sep>[ _]?)(?P<num>\d*)")
 
 # 各“部分”匹配（支持全角/半角）
 BG_RE    = re.compile(r"[（(][^（）()]*[）)]")                 # （）背景声音
@@ -291,6 +293,27 @@ def check_pairing(text, excluded):
     return issues
 
 
+def check_bad_tags(text):
+    """疑似标签检测：不完整（缺 “>”）、中间有空格、被换行拆开（同一标签放不同行）。
+    返回 [(start, end, msg)]。完整标签（TAG_RE 匹配）不在此报错。"""
+    issues = []
+    for m in BAD_TAG_RE.finditer(text):
+        end = m.end()
+        nxt = text[end:end + 1]
+        if nxt == ">":
+            if m.group("sep") == " ":
+                issues.append((m.start(), end + 1,
+                               f"{m.group(0)}格式错误：<{m.group('kind')}_{m.group('num') or 'x'}> 中间不应有空格"))
+            elif not m.group("num"):
+                issues.append((m.start(), end + 1, f"{m.group(0)}格式错误：缺少编号"))
+            continue
+        if nxt == "\n" or "\n" in m.group(0):
+            issues.append((m.start(), end, f"{m.group(0)} 被换行拆开：同一标签不能放在不同行"))
+        else:
+            issues.append((m.start(), end, f"{m.group(0)} 不完整：缺少 “>”"))
+    return issues
+
+
 def check_style_words(text):
     """衔接/推测类表述（接着/可以看到/可以观察）提示。返回 [(start, end, msg)]"""
     return [(m.start(), m.end(), f"出现“{m.group(0)}”，建议避免衔接/推测性表述，直接描述画面")
@@ -457,6 +480,14 @@ def analyze_text(text):
                 bi = k + 1
                 break
         issues.append(Issue(s, e, "error", kind, bi, f"句{bi}: {msg}"))
+    # 疑似标签：不完整/含空格/跨行
+    for s, e, msg in check_bad_tags(text):
+        bi = 1
+        for k, b in enumerate(blocks):
+            if b.start <= s < b.end:
+                bi = k + 1
+                break
+        issues.append(Issue(s, e, "error", "标签", bi, f"句{bi}: {msg}"))
     # 标签记忆：每个 <ID_x> 按首次出现识别五要素；未完整时允许后续出现补齐，
     # 一旦五个元素都识别到即锁定，后面不再覆盖。
     memory = {}
@@ -486,12 +517,16 @@ def analyze_text(text):
 # ============================================================
 
 # 不同 <ID_n> 的配色（背景/前景成对，循环使用；色相拉开便于区分）
+# 红色系（含粉红）不纳入渲染选择；8 色循环避免相邻序号（如 1/6、2/7）撞色
 ID_PALETTE = [
     ("#FFF3A6", "#8B6914"),  # 黄
     ("#FFD9A8", "#8A4A10"),  # 橙
     ("#C9F2C0", "#2E6B2E"),  # 绿
     ("#C9E4FF", "#1F4E8C"),  # 蓝
-    ("#FFD9E0", "#8C2E45"),  # 粉
+    ("#EFDCC0", "#6B4A2B"),  # 棕
+    ("#C9F0EF", "#1F6E6E"),  # 青
+    ("#F2E8D0", "#6B5220"),  # 米
+    ("#D9E4F5", "#2A4A6B"),  # 灰蓝
 ]
 
 def _id_tag_name(widget, num):
@@ -573,6 +608,25 @@ def plain_ranges(text, parts, b):
     return out
 
 
+def subtract_spans(spans, excluded):
+    """从 spans 中减去 excluded 区间，返回剩余片段（用于报错高亮避开标签/换行符）。"""
+    out = []
+    excl = sorted(excluded)
+    for a, b in spans:
+        cur = a
+        for x, y in excl:
+            if y <= cur:
+                continue
+            if x >= b:
+                break
+            if x > cur:
+                out.append((cur, min(x, b)))
+            cur = max(cur, y)
+        if cur < b:
+            out.append((cur, b))
+    return out
+
+
 def apply_highlights_to(widget, text, parts, blocks, issues, current_idx):
     """把解析结果刷到任意 Text 控件上（主编辑区与只读示例窗口共用）。"""
     for tag in ("id_tag", "env_tag", "bg", "voice", "quote", "time", "quality",
@@ -596,13 +650,16 @@ def apply_highlights_to(widget, text, parts, blocks, issues, current_idx):
         if k == "quality":
             continue
         widget.tag_add(k, f"1.0+{s}c", f"1.0+{e}c")
-    # 4) 问题（换行 Issue 仅保留右侧问题列表的 ⏎ 弱提示，文本区不再做任何标记）
+    # 4) 问题（换行 Issue 仅保留右侧问题列表的 ⏎ 弱提示，文本区不再做任何标记；
+    #    报错高亮避开标签区间，避免覆盖标签原有配色；同时避开换行符，防止整行染色）
+    tag_spans = [(m.start(), m.end()) for m in TAG_RE.finditer(text)]
+    nl_spans = [(m.start(), m.start() + 1) for m in re.finditer(r"\n", text)]
     for iss in issues:
         if iss.kind == "换行":
             continue
         tag = "error" if iss.level == "error" else "hint"
-        end = max(iss.end, iss.start + 1)
-        widget.tag_add(tag, f"1.0+{iss.start}c", f"1.0+{end}c")
+        for s, e in subtract_spans([(iss.start, max(iss.end, iss.start + 1))], tag_spans + nl_spans):
+            widget.tag_add(tag, f"1.0+{s}c", f"1.0+{e}c")
     # 5) 当前块 / 已处理
     for i, b in enumerate(blocks):
         if b.done:
@@ -835,6 +892,7 @@ class App:
         self.text.bind("<ButtonPress-1>", self._on_drag_begin)
         self.text.bind("<B1-Motion>", self._on_drag_move)
         self.text.bind("<ButtonRelease-1>", self._on_click)
+        self.text.bind("<Double-Button-1>", self._on_text_dblclick)
         self.text.bind("<KeyRelease>", self._on_key)
         self.text.bind("<<Paste>>", lambda e: self._schedule_parse())
 
@@ -896,15 +954,19 @@ class App:
         elif ch == "在":
             self._show_za_suggestions()
         elif ch and ch.isdigit():
-            # 时间戳联想模板的智能跳格（“从X.Xs到X.Xs，”自动补 s 并跳到“到”/“，”后）
-            if self._time_skip():
+            # 时间戳联想模板的智能跳格（“从X.Xs到X.Xs，”“在X.Xs时，”自动补 s 并跳到“到”/“，”后）
+            if self._time_skip() or self._za_skip():
                 self._ac_close()
-            elif not (self.text.get("insert-2c", "insert-1c") or
-                      self.text.get("insert-2c", "insert-1c") in "0123456789.s从到时至在"):
-                # 数字也触发标签联想（避免在时间数值中输入时打扰：紧接数字/小数点/s/时间词时不触发）
-                self._show_tag_suggestions(digit=ch)
-            elif self._ac_active():
-                self._ac_close()
+            else:
+                try:
+                    prev = self.text.get("insert-2c", "insert-1c")
+                except tk.TclError:
+                    prev = ""
+                if not prev or prev not in "0123456789.s从到时至在":
+                    # 数字也触发标签联想（避免在时间数值中输入时打扰：紧接数字/小数点/s/时间词时不触发）
+                    self._show_tag_suggestions(digit=ch)
+                elif self._ac_active():
+                    self._ac_close()
         elif self._ac_active() and ch and ch not in ("<", "从", "在"):
             self._ac_close()
         return None
@@ -999,7 +1061,7 @@ class App:
         跳过模板占位的空格与“s”，并把光标跳到“到”后（从段）或“，”后（到段）。
         仅当光标后确为模板结构时才跳，避免干扰手动输入。返回是否发生了跳格。"""
         before = self.text.get("1.0", "insert")
-        m = re.search(r"(从|到)\s*(\d)\.(\d)$", before)
+        m = re.search(r"(从|到)\s*(\d+)\.(\d+)$", before)
         if not m:
             return False
         # 删除光标后的占位空格（模板“从 s到 s，”中的空格）
@@ -1028,6 +1090,23 @@ class App:
         """时间点模板：在 s时，（选择后光标停在“在”后）。"""
         tmpl = "在 s时，"
         return [(tmpl, tmpl, 1, False)]
+
+    def _za_skip(self):
+        """时间点模板的智能跳格：输入构成“在X.X”（小数点后已输入一位数字）时，
+        跳过占位空格与“s”“时”，光标跳到“，”后。仅当光标后为模板结构时才跳。"""
+        before = self.text.get("1.0", "insert")
+        if not re.search(r"在\s*\d+\.\d+$", before):
+            return False
+        while self.text.get("insert", "insert+1c") == " ":
+            self.text.delete("insert", "insert+1c")
+        if self.text.get("insert", "insert+1c") == "s":
+            self.text.mark_set("insert", "insert+1c")
+        else:
+            self.text.insert("insert", "s")
+        if self.text.get("insert", "insert+2c") == "时，":
+            self.text.mark_set("insert", "insert+2c")
+            return True
+        return False
 
     def _caret_xy(self):
         try:
@@ -1279,6 +1358,20 @@ class App:
         self.text.focus_set()
         self.update_current_from_caret(force=True)
         self.text.tag_add("chunk_editing", f"1.0+{iss.start}c", f"1.0+{max(iss.end, iss.start + 1)}c")
+
+    def _on_text_dblclick(self, event=None):
+        """双击文本区：命中报错位置时，右侧问题列表滚动并选中对应条目。"""
+        try:
+            pos = self._tk_index_to_offset("current")
+        except tk.TclError:
+            return
+        for i, iss in enumerate(self.issues):
+            if iss.level == "error" and iss.start <= pos < max(iss.end, iss.start + 1):
+                self.issue_list.selection_clear(0, "end")
+                self.issue_list.selection_set(i)
+                self.issue_list.see(i)
+                self.issue_list.activate(i)
+                return
 
     # ---------- 高亮与面板刷新 ----------
     def _apply_highlights(self):
@@ -1612,6 +1705,12 @@ def self_test():
     assert any("连续标点" in m for _, _, _, m in check_punctuation("画面，，细节", [])), "连续标点应告警"
     # 块数量应多于1（句号切分生效）
     assert len(blocks) >= 8, f"应按句号切分出多个块，实际 {len(blocks)}"
+    # 疑似标签：不完整 / 含空格 / 跨行
+    assert any("不完整" in m for _, _, m in check_bad_tags("<ID_2 平拍一名男子。")), "缺 > 应告警"
+    assert any("空格" in m for _, _, m in check_bad_tags("<ID 1>平拍一名男子。")), "标签空格应告警"
+    assert any("换行拆开" in m for _, _, m in check_bad_tags("<ID_6\n的方向。")), "标签跨行应告警"
+    assert not any("格式错误" in m or "不完整" in m or "换行拆开" in m
+                   for _, _, m in check_bad_tags("<ID_1>平拍一名男子。")), "完整标签不应告警"
     print("\n自测通过 ✔")
 
 
