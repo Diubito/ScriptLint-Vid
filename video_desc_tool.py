@@ -792,6 +792,8 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._set_status("就绪。粘贴文本后自动解析；光标所在的句子即当前编辑块；选中文字即变为语块。")
+        # 禁用最大化/全屏（该窗口不允许全屏）：窗口映射后移除 WS_MAXIMIZEBOX 样式
+        self.root.after(300, self._disable_maximize)
         # 启动时自动恢复上次会话
         self.root.after(200, self._auto_load)
 
@@ -812,7 +814,8 @@ class App:
 
         # 主区域：左侧文本（最小 640px 宽，保证可见），右侧面板
         main = ttk.Frame(self.root)
-        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        # 注意：main.pack 在 _build_ui 末尾（状态栏 pack 之后）调用，
+        # 保证小窗口时底部状态栏优先占位、不被主区域挤压
         main.rowconfigure(0, weight=1)
         main.columnconfigure(0, weight=1, minsize=640)   # 文本列：占满剩余宽度，至少 640
         main.columnconfigure(1, weight=0, minsize=300)   # 右侧面板：自然宽度，至少 300
@@ -834,10 +837,10 @@ class App:
         self.cur_info = ttk.Label(t1, text="（未解析）", wraplength=300, justify=tk.LEFT)
         self.cur_info.pack(anchor=tk.W)
         self.check_rows = {}
-        cf = ttk.LabelFrame(t1, text="五要素（ID 首次出现）")
-        cf.pack(fill=tk.X, pady=6)
+        self.check_lf = ttk.LabelFrame(t1, text="五要素（ID 首次出现）")
+        self.check_lf.pack(fill=tk.X, pady=6)
         for e in ELEMENTS:
-            row = ttk.Frame(cf)
+            row = ttk.Frame(self.check_lf)
             row.pack(fill=tk.X, pady=1)
             ttk.Label(row, text=f"{e}", width=4, font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
             val = ttk.Label(row, text="—", anchor=tk.W)
@@ -848,17 +851,7 @@ class App:
         self.cur_note = ttk.Label(t1, text="", wraplength=300, justify=tk.LEFT, foreground="#666666")
         self.cur_note.pack(anchor=tk.W, pady=(4, 0))
 
-        # 块列表
-        t2 = ttk.Frame(nb, padding=6)
-        nb.add(t2, text="块列表（按句）")
-        self.block_list = tk.Listbox(t2, font=("Microsoft YaHei UI", 10), exportselection=False)
-        sb2 = ttk.Scrollbar(t2, command=self.block_list.yview)
-        self.block_list.config(yscrollcommand=sb2.set)
-        self.block_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb2.pack(side=tk.RIGHT, fill=tk.Y)
-        self.block_list.bind("<<ListboxSelect>>", self._on_block_select)
-
-        # 问题/提示
+        # 问题/提示（先于块列表）
         t3 = ttk.Frame(nb, padding=6)
         nb.add(t3, text="问题/提示")
         self.issue_count = ttk.Label(t3, text="")
@@ -869,6 +862,16 @@ class App:
         self.issue_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb3.pack(side=tk.RIGHT, fill=tk.Y)
         self.issue_list.bind("<Double-Button-1>", self._on_issue_jump)
+
+        # 块列表
+        t2 = ttk.Frame(nb, padding=6)
+        nb.add(t2, text="块列表（按句）")
+        self.block_list = tk.Listbox(t2, font=("Microsoft YaHei UI", 10), exportselection=False)
+        sb2 = ttk.Scrollbar(t2, command=self.block_list.yview)
+        self.block_list.config(yscrollcommand=sb2.set)
+        self.block_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb2.pack(side=tk.RIGHT, fill=tk.Y)
+        self.block_list.bind("<<ListboxSelect>>", self._on_block_select)
 
         # 图例与帮助
         t4 = ttk.Frame(nb, padding=8)
@@ -919,9 +922,15 @@ class App:
         )
         ttk.Label(t4, text=help_txt, justify=tk.LEFT, foreground="#333333").pack(anchor=tk.W, pady=8)
 
-        # 状态栏
+        # 状态栏（先 pack，占底部，小窗口时也可见）
         self.status = ttk.Label(self.root, relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2))
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
+        # 主区域最后 pack，占剩余空间
+        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        # 鼠标滚轮：悬停在右侧列表上时上下滚动；Shift+滚轮 水平滚动，其余位置交给默认处理
+        self.root.bind_all("<MouseWheel>", self._on_list_wheel)
+        self.root.bind_all("<Shift-MouseWheel>", self._on_list_shift_wheel)
 
         # 鼠标位置决定当前块；拖选时实时显示“语块”高亮（无需松开鼠标）
         self.text.bind("<ButtonPress-1>", self._on_drag_begin)
@@ -1376,6 +1385,22 @@ class App:
         self._restore_view(y0)
         self._set_status("已重置所有块的处理状态。")
 
+    def _on_list_wheel(self, event):
+        w = event.widget
+        if w is self.block_list or w is self.issue_list:
+            delta = -int(event.delta / 120) * 3
+            w.yview_scroll(delta, "units")
+            return "break"
+        return None
+
+    def _on_list_shift_wheel(self, event):
+        w = event.widget
+        if w is self.block_list or w is self.issue_list:
+            delta = -int(event.delta / 120) * 3
+            w.xview_scroll(delta, "units")
+            return "break"
+        return None
+
     def _on_block_select(self, event=None):
         sel = self.block_list.curselection()
         if sel:
@@ -1456,6 +1481,7 @@ class App:
     def _refresh_current_panel(self):
         if not self.blocks or self.current_idx >= len(self.blocks):
             self.cur_info.config(text="（无文本）")
+            self.check_lf.config(text="五要素（ID 首次出现）")
             for e in ELEMENTS:
                 self.check_rows[e].config(text="—", foreground="#000000")
             self.part_summary.config(text="")
@@ -1468,10 +1494,10 @@ class App:
         show_tag = block_tags[0] if len(block_tags) == 1 else self._tag_under_cursor()
         mem = self.tag_memory.get(show_tag) if show_tag else None
         if mem is not None:
-            if len(block_tags) == 1:
-                title = f"标签 {show_tag}（记忆自首次出现）"
-            else:
-                title = f"标签 {show_tag}（记忆自首次出现）"
+            first_pos = self.raw_text.find(show_tag)
+            is_first = b.start <= first_pos < b.end
+            self.check_lf.config(text="五要素（ID 首次出现）" if is_first else "五要素（读取记忆）")
+            title = f"标签 {show_tag}" + ("（记忆自首次出现）" if is_first else "")
             self.cur_info.config(text=title)
             for e in ELEMENTS:
                 v = clean_show(mem.get(e))
@@ -1480,7 +1506,9 @@ class App:
                 else:
                     self.check_rows[e].config(text="✗ 未识别", foreground="#c00000")
             missing = [e for e in ELEMENTS if not mem.get(e)]
-            note = "✓ 五要素齐全（记忆自首次出现）" if not missing else f"记忆缺少：{'、'.join(missing)}"
+            note = "✓ 五要素齐全" if not missing else f"记忆缺少：{'、'.join(missing)}"
+            if is_first:
+                note += "（记忆自首次出现）"
             self.cur_note.config(text=note, foreground=("#1a7f37" if not missing else "#c00000"))
             self._panel_part_summary(b)
             return
@@ -1494,6 +1522,7 @@ class App:
             first_txt = ""
         self.cur_info.config(text=f"当前块：{tag}{first_txt}")
         if b.checklist is not None:
+            self.check_lf.config(text="五要素（ID 首次出现）")
             for e in ELEMENTS:
                 v = clean_show(b.checklist.get(e))
                 if v:
@@ -1506,6 +1535,7 @@ class App:
         else:
             if b.kind == "ID":
                 # 非首次出现：同样读取五要素并展示（仅展示，不告警）
+                self.check_lf.config(text="五要素（读取记忆）")
                 read = check_id_elements(b.text)
                 for e in ELEMENTS:
                     v = clean_show(read.get(e))
@@ -1516,6 +1546,7 @@ class App:
                 self.cur_note.config(text="ID 非首次出现：已读取五要素（仅供参考）", foreground="#666666")
             elif b.kind == "ENV":
                 # ENV 句：检查【景别】（全景/特写等）
+                self.check_lf.config(text="五要素（ENV 景别）")
                 mshot = SHOT_RE.search(b.text)
                 v = mshot.group(0) if mshot else None
                 for e in ELEMENTS:
@@ -1530,6 +1561,7 @@ class App:
                     text=(f"✓ ENV 景别：{v}" if v else "ENV 环境句：缺少【景别】（如全景/特写/中景/近景）"),
                     foreground=("#1a7f37" if v else "#c00000"))
             else:
+                self.check_lf.config(text="五要素")
                 for e in ELEMENTS:
                     self.check_rows[e].config(text="—", foreground="#000000")
                 qs = quality_spans(self.raw_text)
@@ -1579,6 +1611,20 @@ class App:
         except Exception as e:
             if not silent:
                 messagebox.showerror("保存失败", str(e))
+
+    def _disable_maximize(self):
+        """移除窗口 WS_MAXIMIZEBOX（0x00010000）样式：最大化按钮禁用，Win+↑/双击标题栏不再全屏；
+        保留 WS_MINIMIZEBOX（0x00020000），最小化按钮不受影响。"""
+        try:
+            import ctypes
+            hwnd = self.root.winfo_id()
+            anc = ctypes.windll.user32.GetAncestor(hwnd, 2)  # GA_ROOT=2
+            if not anc:
+                anc = hwnd
+            style = ctypes.windll.user32.GetWindowLongW(anc, -16)  # GWL_STYLE
+            ctypes.windll.user32.SetWindowLongW(anc, -16, style & ~0x00010000)
+        except Exception:
+            pass
 
     def _auto_load(self):
         """启动时自动恢复上次保存的文本与处理进度。"""
