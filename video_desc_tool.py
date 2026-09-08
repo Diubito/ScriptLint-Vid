@@ -206,6 +206,33 @@ def check_time_loose(text, excluded):
     return issues
 
 
+def check_time_gaps(text):
+    """时间连续性：以 0.0s 为起始、最大结束时间为终点，检查区间之间是否有未描述的
+    空洞；同时校验区间起点应不大于终点（“从As到Bs”时 A>B 报错）。
+    返回 [(start, end, msg)]，空洞位置放在其后一个时间戳的起点处。"""
+    issues = []
+    ranges = []
+    for m in TIME_RE.finditer(text):
+        try:
+            a, b = float(m.group(1)), float(m.group(2))
+        except ValueError:
+            continue
+        if a > b:
+            issues.append((m.start(), m.end(),
+                           f"时间区间起点 {m.group(1)}s 大于终点 {m.group(2)}s，应“从X.Xs到X.Xs”顺序书写"))
+            continue
+        ranges.append((a, b, m.start()))
+    if not ranges:
+        return issues
+    ranges.sort()
+    cur = 0.0
+    for a, b, pos in ranges:
+        if a > cur + 0.001:
+            issues.append((pos, pos + 1, f"时间空洞：{cur:g}s-{a:g}s 未描述"))
+        cur = max(cur, b)
+    return issues
+
+
 def _all_time_spans(text):
     """全部时间匹配区间（区间、时间点、游离令牌）：内部空格全部豁免。"""
     spans = [m.span() for m in TIME_RE.finditer(text)]
@@ -488,6 +515,14 @@ def analyze_text(text):
                 bi = k + 1
                 break
         issues.append(Issue(s, e, "error", "标签", bi, f"句{bi}: {msg}"))
+    # 时间连续性：区间空洞与起点大于终点
+    for s, e, msg in check_time_gaps(text):
+        bi = 1
+        for k, b in enumerate(blocks):
+            if b.start <= s < b.end:
+                bi = k + 1
+                break
+        issues.append(Issue(s, e, "error", "时间", bi, f"句{bi}: {msg}"))
     # 标签记忆：每个 <ID_x> 按首次出现识别五要素；未完整时允许后续出现补齐，
     # 一旦五个元素都识别到即锁定，后面不再覆盖。
     memory = {}
@@ -1536,7 +1571,11 @@ class App:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             if not silent:
-                self._set_status(f"已保存到 {path}")
+                gaps = check_time_gaps(self.raw_text)
+                if gaps:
+                    self._set_status(f"已保存到 {path}，但存在 {len(gaps)} 处时间空洞/倒置")
+                else:
+                    self._set_status(f"已保存到 {path}")
         except Exception as e:
             if not silent:
                 messagebox.showerror("保存失败", str(e))
@@ -1711,6 +1750,11 @@ def self_test():
     assert any("换行拆开" in m for _, _, m in check_bad_tags("<ID_6\n的方向。")), "标签跨行应告警"
     assert not any("格式错误" in m or "不完整" in m or "换行拆开" in m
                    for _, _, m in check_bad_tags("<ID_1>平拍一名男子。")), "完整标签不应告警"
+    # 时间空洞与区间倒置
+    gaps = [m for _, _, m in check_time_gaps("从0.0s到6.9s，从7.5s到8.6s。")]
+    assert any("6.9s-7.5s" in m for m in gaps), "应报时间空洞 6.9s-7.5s"
+    assert not check_time_gaps("从0.0s到6.9s，从6.9s到8.6s。"), "首尾相接不应报空洞"
+    assert any("大于终点" in m for _, _, m in check_time_gaps("从8.6s到7.5s。")), "区间倒置应报错"
     print("\n自测通过 ✔")
 
 
