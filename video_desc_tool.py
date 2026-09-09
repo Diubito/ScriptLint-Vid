@@ -757,6 +757,43 @@ LEGEND = [
 ]
 
 
+QC_TAGS = [
+    ("真实性问题", "根据画面不是或不确定"),
+    ("客观性问题", "根据画面但表述有歧义；情绪、物理效果等极易中标，风格、动作等总结性也极易出现"),
+    ("唯一性问题", "表述不够准确、贴合画面，不够有排他性"),
+    ("冗余问题", "出于种种原因，无法定位原因的不通畅"),
+    ("主体定位问题", "定位缺失"),
+    ("逻辑问题", "对应主体模糊或缺失，流水账表述"),
+    ("时序问题", "时间与描述内容不对应"),
+]
+
+
+class Tooltip:
+    """悬停提示气泡：用于展示质检标签的括号说明。"""
+
+    def __init__(self, widget, text):
+        self.widget, self.text, self.tip = widget, text, None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress-1>", self._hide, add="+")
+
+    def _show(self, event=None):
+        if self.tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 8
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, bg="#FFFFE0", relief="solid", borderwidth=1,
+                 font=("Microsoft YaHei UI", 9), wraplength=340, justify=tk.LEFT).pack()
+
+    def _hide(self, event=None):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -921,6 +958,37 @@ class App:
             "“保存”会把当前文本与处理进度存到本地 .json。"
         )
         ttk.Label(t4, text=help_txt, justify=tk.LEFT, foreground="#333333").pack(anchor=tk.W, pady=8)
+
+        # 质检输出
+        t5 = ttk.Frame(nb, padding=6)
+        nb.add(t5, text="质检输出")
+        qc_top = ttk.Frame(t5)
+        qc_top.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(qc_top, text="加入选中", command=self._qc_add_sel).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(qc_top, text="先在左侧选中文字，再点下方标签；悬停标签可看说明",
+                  foreground="#666666").pack(side=tk.LEFT)
+        qc_btns = ttk.Frame(t5)
+        qc_btns.pack(fill=tk.X, pady=(0, 4))
+        for i, (label, desc) in enumerate(QC_TAGS):
+            b = ttk.Button(qc_btns, text=label, command=lambda l=label: self._qc_add_tag(l))
+            b.grid(row=i // 3, column=i % 3, padx=2, pady=2, sticky="ew")
+            Tooltip(b, desc)
+        for c in range(3):
+            qc_btns.columnconfigure(c, weight=1)
+        self.qc_text = tk.Text(t5, font=("Microsoft YaHei UI", 10), wrap="word",
+                               undo=True, padx=4, pady=4)
+        qc_sb = ttk.Scrollbar(t5, command=self.qc_text.yview)
+        self.qc_text.config(yscrollcommand=qc_sb.set)
+        self.qc_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        qc_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        # 质检输出框联想状态
+        self._qc_ac_top = None
+        self._qc_ac_listbox = None
+        self._qc_ac_items = []
+        self._qc_ac_start_idx = None
+        self._prev_qc_text = None
+        self.qc_text.bind("<KeyRelease>", self._on_qc_key)
+        self.qc_text.bind("<Button-1>", self._on_qc_click)
 
         # 状态栏（先 pack，占底部，小窗口时也可见）
         self.status = ttk.Label(self.root, relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2))
@@ -1401,6 +1469,263 @@ class App:
             return "break"
         return None
 
+    def _qc_add_sel(self):
+        """把左侧选中的文字复制到质检输出，其后加冒号。"""
+        try:
+            sel = self.text.tag_ranges("sel")
+        except tk.TclError:
+            return
+        if not sel:
+            self._set_status("请先在左侧选中文字。")
+            return
+        txt = " ".join(self.text.get(sel[0], sel[1]).split("\n")).strip()
+        if not txt:
+            return
+        qc = self.qc_text
+        if qc.get("1.0", "end-1c").strip():
+            qc.insert(tk.END, "\n" + txt + "：")
+        else:
+            qc.insert(tk.END, txt + "：")
+        qc.mark_set("insert", "end-1c")
+        qc.see("end")
+        qc.focus_set()
+
+    def _qc_add_tag(self, label):
+        """在质检输出光标处插入标签。"""
+        qc = self.qc_text
+        pos = qc.index("insert")
+        qc.insert(pos, label)
+        qc.mark_set("insert", qc.index(f"{pos}+{len(label)}c"))
+        qc.see("insert")
+        qc.focus_set()
+
+    # ---------- 质检输出框联想 ----------
+    def _qc_detect_typed_char(self):
+        cur = self.qc_text.get("1.0", "end-1c")
+        prev = getattr(self, "_prev_qc_text", None)
+        self._prev_qc_text = cur
+        if prev is None or cur == prev:
+            return ""
+        try:
+            return self.qc_text.get("insert-1c", "insert")
+        except tk.TclError:
+            return ""
+
+    def _qc_candidates(self, ch):
+        """质检输出联想：标签（仅左侧文本中已有的，不可新建）+ 时间/时间点模板。"""
+        if ch == "<" or (ch and ch.isdigit()):
+            tags = set()
+            for m in TAG_RE.finditer(self.raw_text):
+                tags.add(m.group(0))
+            items = []
+            if ch and ch.isdigit():
+                d = int(ch)
+                for t in sorted(tags):
+                    if t.startswith("<ID_%d>" % d) or t.startswith("<ENV_%d>" % d):
+                        items.append((t, t, len(t), True))
+            def _tag_key(x):
+                m = TAG_RE.match(x)
+                return (m.group("kind"), int(m.group("num")))
+            for t in sorted(tags, key=_tag_key):
+                if (t, t, len(t), True) not in items:
+                    items.append((t, t, len(t), True))
+            return items
+        if ch == "从":
+            return [("从 s到 s，", "从 s到 s，", 1, False)]
+        if ch == "在":
+            return [("在 s时，", "在 s时，", 1, False)]
+        return []
+
+    def _qc_time_skip(self):
+        """质检输出框时间模板智能跳格：从/在 段小数点后输入字符时跳到“到”后或“，”后。"""
+        qc = self.qc_text
+        before = qc.get("1.0", "insert")
+        m = re.search(r"(从|到)\s*(\d+)\.(\d+)$", before)
+        if m:
+            while qc.get("insert", "insert+1c") == " ":
+                qc.delete("insert", "insert+1c")
+            if qc.get("insert", "insert+1c") == "s":
+                qc.mark_set("insert", "insert+1c")
+            else:
+                qc.insert("insert", "s")
+            if m.group(1) == "从":
+                if qc.get("insert", "insert+1c") == "到":
+                    qc.mark_set("insert", "insert+1c")
+                    if qc.get("insert", "insert+1c") == " ":
+                        qc.delete("insert", "insert+1c")
+                    return True
+                return False
+            else:
+                if qc.get("insert", "insert+1c") == "，":
+                    qc.mark_set("insert", "insert+1c")
+                    return True
+                return False
+        if re.search(r"在\s*\d+\.\d+$", before):
+            while qc.get("insert", "insert+1c") == " ":
+                qc.delete("insert", "insert+1c")
+            if qc.get("insert", "insert+1c") == "s":
+                qc.mark_set("insert", "insert+1c")
+            else:
+                qc.insert("insert", "s")
+            if qc.get("insert", "insert+2c") == "时，":
+                qc.mark_set("insert", "insert+2c")
+                return True
+            return False
+        return False
+
+    def _on_qc_key(self, event):
+        ch = self._qc_detect_typed_char()
+        if ch == "<":
+            self._qc_ac_start_idx = self.qc_text.index("insert-1c")
+            self._qc_ac_show(self._qc_candidates("<"))
+        elif ch == "从":
+            self._qc_ac_start_idx = self.qc_text.index("insert-1c")
+            self._qc_ac_show(self._qc_candidates("从"))
+        elif ch == "在":
+            self._qc_ac_start_idx = self.qc_text.index("insert-1c")
+            self._qc_ac_show(self._qc_candidates("在"))
+        elif ch and ch.isdigit():
+            if self._qc_time_skip():
+                self._qc_ac_close()
+            else:
+                try:
+                    prev = self.qc_text.get("insert-2c", "insert-1c")
+                except tk.TclError:
+                    prev = ""
+                if not prev or prev not in "0123456789.s从到时至在":
+                    self._qc_ac_start_idx = self.qc_text.index("insert-1c")
+                    self._qc_ac_show(self._qc_candidates(ch))
+                elif self._qc_ac_active():
+                    self._qc_ac_close()
+        elif self._qc_ac_active() and ch and ch not in ("<", "从", "在"):
+            self._qc_ac_close()
+        return None
+
+    def _on_qc_click(self, event=None):
+        if self._qc_ac_active():
+            self._qc_ac_close()
+
+    def _qc_caret_xy(self):
+        try:
+            b = self.qc_text.bbox("insert")
+        except tk.TclError:
+            b = None
+        if not b:
+            bx, by, bw, bh = 10, 10, 0, 0
+        else:
+            bx, by, bw, bh = b
+        return self.qc_text.winfo_rootx() + bx, self.qc_text.winfo_rooty() + by + bh
+
+    def _qc_ac_active(self):
+        return self._qc_ac_top is not None
+
+    def _qc_ac_show(self, items):
+        self._qc_ac_close()
+        if not items:
+            return
+        self._qc_ac_items = items
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        lb = tk.Listbox(top, font=("Microsoft YaHei UI", 11),
+                        height=min(len(items), 8), exportselection=False,
+                        activestyle="dotbox", selectbackground="#CCE5FF",
+                        selectforeground="#000000")
+        lb.pack(fill=tk.BOTH, expand=True)
+        for disp, ins, cur_off, add_sp in items:
+            lb.insert(tk.END, disp)
+        lb.selection_set(0)
+        x, y = self._qc_caret_xy()
+        h = 24 * min(len(items), 8)
+        scr_h = self.root.winfo_screenheight()
+        if y + h > scr_h - 40:
+            y = max(40, scr_h - 40 - h)
+        top.geometry(f"+{x}+{y}")
+        top.deiconify()
+        self._qc_ac_top = top
+        self._qc_ac_listbox = lb
+        self.qc_text.bind("<Down>", self._qc_ac_down)
+        self.qc_text.bind("<Up>", self._qc_ac_up)
+        self.qc_text.bind("<Return>", self._qc_ac_enter)
+        self.qc_text.bind("<KP_Enter>", self._qc_ac_enter)
+        self.qc_text.bind("<Escape>", self._qc_ac_escape)
+        self.qc_text.bind("<Tab>", self._qc_ac_enter)
+        lb.bind("<ButtonRelease-1>", lambda e: self._qc_ac_accept())
+        self.qc_text.focus_set()
+
+    def _qc_ac_close(self):
+        if self._qc_ac_top is not None:
+            try:
+                self._qc_ac_top.destroy()
+            except tk.TclError:
+                pass
+            self._qc_ac_top = None
+            self._qc_ac_listbox = None
+            self._qc_ac_items = []
+            for seq in ("<Down>", "<Up>", "<Return>", "<KP_Enter>", "<Escape>", "<Tab>"):
+                try:
+                    self.qc_text.unbind(seq)
+                except tk.TclError:
+                    pass
+
+    def _qc_ac_down(self, e=None):
+        lb = self._qc_ac_listbox
+        sel = lb.curselection()
+        nxt = (sel[0] + 1) if sel else 0
+        if nxt < lb.size():
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(nxt)
+            lb.see(nxt)
+        return "break"
+
+    def _qc_ac_up(self, e=None):
+        lb = self._qc_ac_listbox
+        sel = lb.curselection()
+        nxt = (sel[0] - 1) if sel else 0
+        if nxt >= 0:
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(nxt)
+            lb.see(nxt)
+        return "break"
+
+    def _qc_ac_enter(self, e=None):
+        self._qc_ac_accept()
+        return "break"
+
+    def _qc_ac_escape(self, e=None):
+        self._qc_ac_close()
+        return "break"
+
+    def _qc_ac_accept(self):
+        lb = self._qc_ac_listbox
+        if lb is None:
+            return
+        sel = lb.curselection()
+        idx = sel[0] if sel else 0
+        if 0 <= idx < len(self._qc_ac_items):
+            self._qc_do_insert(idx)
+        self._qc_ac_close()
+
+    def _qc_do_insert(self, idx):
+        display, insert_text, cursor_chars, add_spaces = self._qc_ac_items[idx]
+        qc = self.qc_text
+        qc.delete(self._qc_ac_start_idx, "insert")
+        before = qc.get("insert-1c", "insert") if qc.compare("insert", ">", "1.0") else ""
+        after = qc.get("insert", "insert+1c") if qc.compare("insert", "<", "end-1c") else ""
+        prefix = suffix = ""
+        if add_spaces:
+            if before and not before.isspace():
+                prefix = " "
+            if after and not after.isspace():
+                suffix = " "
+        qc.insert("insert", prefix + insert_text + suffix)
+        total = len(prefix) + len(insert_text) + len(suffix)
+        ins_start = qc.index(f"insert-{total}c")
+        cur = f"{ins_start}+{len(prefix) + cursor_chars}c"
+        qc.mark_set("insert", cur)
+        qc.see("insert")
+        self._prev_qc_text = qc.get("1.0", "end-1c")
+
     def _on_block_select(self, event=None):
         sel = self.block_list.curselection()
         if sel:
@@ -1597,6 +1922,7 @@ class App:
             "text": self.raw_text,
             # done 键为 ("s", 块文本)，仅存文本部分（可 JSON 序列化）
             "done": sorted(k[1] for k in self.done_keys),
+            "qc": self.qc_text.get("1.0", "end-1c"),
         }
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_desc_session.json")
         try:
@@ -1647,6 +1973,9 @@ class App:
                 self.done_keys.add(("s", item[1]))
         self.text.insert("1.0", txt)
         self.parse_all()
+        qc = data.get("qc", "")
+        if qc:
+            self.qc_text.insert("1.0", qc)
         self._set_status(f"已自动恢复上次会话（{len(self.blocks)} 个句子块）。")
 
     def _on_close(self):
