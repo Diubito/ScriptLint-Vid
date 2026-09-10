@@ -19,3 +19,38 @@ _tkinter.TclError: expected integer but got "coord"
 2026-09-10 15:14:02 启动视频描述工具
 2026-09-10 15:14:21 启动视频描述工具
 2026-09-10 15:45:17 启动视频描述工具
+2026-09-10 16:14:40 启动视频描述工具
+2026-09-10 16:14:40 未捕获异常:
+Traceback (most recent call last):
+  File "<string>", line 12, in <module>
+    print('菜单:', [app.root.nametowidget(m).cget('label') for m in app.root['menu'].winfo_children()])
+                                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'winfo_children'
+
+2026-09-10 16:14:49 启动视频描述工具
+2026-09-10 16:15:00 启动视频描述工具
+2026-09-10 16:15:01 未捕获异常:
+Traceback (most recent call last):
+  File "<string>", line 12, in <module>
+    print('菜单栏:', menu.cget('label'))
+                     ~~~~~~~~~^^^^^^^^^
+  File "C:\Users\EDY\AppData\Local\Doubao\User Data\sandbox_runtime\bases\c98c5042338ed152c6f10ecd8591889f\python\Lib\tkinter\__init__.py", line 1869, in cget
+    return self.tk.call(self._w, 'cget', '-' + key)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_tkinter.TclError: unknown option "-label"
+
+2026-09-10 16:15:12 启动视频描述工具
+2026-09-10 16:15:18 启动视频描述工具
+2026-09-10 16:15:18 启动视频描述工具
+2026-09-10 16:15:55 启动视频描述工具
+2026-09-10 16:16:32 启动视频描述工具
+2026-09-10 16:18:15 启动视频描述工具
+2026-09-10 16:18:32 启动视频描述工具
+2026-09-10 16:19:05 启动视频描述工具
+2026-09-10 16:49:47 启动视频描述工具
+2026-09-10 20:22:49 启动视频描述工具
+2026-09-10 20:26:03 启动视频描述工具
+2026-09-10 20:27:53 启动视频描述工具
+2026-09-10 20:28:11 启动视频描述工具
+2026-09-10 20:30:06 启动视频描述工具
+2026-09-10 20:50:44 启动视频描述工具

@@ -817,8 +817,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("视频描述长文本辅助处理工具")
-        root.geometry("980x640")
-        root.minsize(900, 560)
+        root.geometry("940x610")
+        root.minsize(880, 540)
 
         self.raw_text = ""
         self.parts = []
@@ -865,6 +865,14 @@ class App:
 
     # ---------- UI ----------
     def _build_ui(self):
+        # 菜单栏“帮助”：示例、图例与帮助
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="帮助", menu=help_menu)
+        help_menu.add_command(label="示例（只读演示）", command=self.show_sample)
+        help_menu.add_command(label="图例与帮助", command=self.show_help)
+        self.root.config(menu=menubar)
+
         top = ttk.Frame(self.root, padding=(6, 4))
         top.pack(side=tk.TOP, fill=tk.X)
 
@@ -873,7 +881,6 @@ class App:
         ttk.Button(top, text="完成选中块", command=self.mark_selected_done).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="全部重置", command=self.reset_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="保存 (Ctrl+S)", command=self.save).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="示例（只读）", command=self.show_sample).pack(side=tk.LEFT, padx=2)
 
         ttk.Checkbutton(top, text="窗口置顶", variable=self.topmost_var,
                         command=self._toggle_topmost).pack(side=tk.LEFT, padx=(16, 2))
@@ -963,16 +970,7 @@ class App:
         self.block_list.tag_configure("cur", foreground="#1a5fb4")
         self.block_list.bind("<Button-1>", self._on_block_click)
 
-        # 图例与帮助（add 移到质检之后）
-        t4 = ttk.Frame(nb, padding=8)
-        leg = ttk.Frame(t4)
-        leg.pack(anchor=tk.W)
-        for tag, desc in LEGEND:
-            r = ttk.Frame(leg)
-            r.pack(anchor=tk.W, pady=1)
-            sw = tk.Label(r, text="  ", bg=self._tag_bg(tag), width=4, relief="solid")
-            sw.pack(side=tk.LEFT, padx=(0, 6))
-            ttk.Label(r, text=desc).pack(side=tk.LEFT)
+        # 帮助内容（经“帮助”菜单的“图例与帮助”查看）
         help_txt = (
             "\n操作流程：\n"
             "1. 将长文本粘贴进左侧文本框（自动解析）；\n"
@@ -1009,16 +1007,11 @@ class App:
             "“示例（只读）”在独立只读窗口中演示，不影响你的文本。\n"
             "“保存”会把当前文本与处理进度存到本地 .json。"
         )
-        self.help_label = ttk.Label(t4, text=help_txt, justify=tk.LEFT, foreground="#333333",
-                                    wraplength=280)
-        self.help_label.pack(anchor=tk.W, pady=8, fill=tk.X)
-        self.help_label.bind("<Configure>",
-                             lambda e: self.help_label.config(wraplength=max(120, e.width - 8)))
+        self.help_txt = help_txt
 
         # 质检
         t5 = ttk.Frame(self.nb, padding=6)
         self.nb.add(t5, text="质检")
-        nb.add(t4, text="图例/帮助")
         qc_top = ttk.Frame(t5)
         qc_top.pack(fill=tk.X, pady=(0, 4))
         ttk.Button(qc_top, text="加入选中", command=self._qc_add_sel).pack(side=tk.LEFT, padx=(0, 6))
@@ -1067,6 +1060,17 @@ class App:
         self.text.bind("<Double-Button-1>", self._on_text_dblclick)
         self.text.bind("<KeyRelease>", self._on_key)
         self.text.bind("<<Paste>>", lambda e: self._schedule_parse())
+
+        # 默认左右比例：左侧占更多（约 72%），用户可拖动分隔条调整
+        # 窗口映射后设置才生效，故延迟调用
+        self.root.after(120, self._set_default_sash)
+
+    def _set_default_sash(self):
+        try:
+            self.root.update_idletasks()
+            self.paned.sashpos(0, 680)
+        except tk.TclError:
+            pass
 
     def _tag_bg(self, tag):
         m = {
@@ -1538,7 +1542,7 @@ class App:
             return
         qc = self.qc_text
         pos = qc.index("insert")
-        text = "、".join(f"{m}" for m in miss) + "缺失"
+        text = "、".join(miss) + "描述缺失"
         qc.insert(pos, text)
         qc.mark_set("insert", qc.index(f"{pos}+{len(text)}c"))
         qc.see("insert")
@@ -2175,6 +2179,26 @@ class App:
             except Exception:
                 pass
             self.root.destroy()
+
+    def show_help(self):
+        """图例与帮助：独立只读窗口。"""
+        win = tk.Toplevel(self.root)
+        win.title("图例与帮助")
+        win.geometry("680x640")
+        win.attributes("-topmost", True)
+        box = tk.Text(win, wrap="word", font=("Microsoft YaHei UI", 10), padx=10, pady=10)
+        box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        box.tag_configure("head", font=("Microsoft YaHei UI", 11, "bold"))
+        box.insert("end", "【图例】\n", "head")
+        for i, (tag, desc) in enumerate(LEGEND):
+            box.insert("end", "■ " + desc + "\n")
+            ls = box.index("end-1c linestart")
+            tn = "sw%d" % i
+            box.tag_configure(tn, foreground=self._tag_bg(tag))
+            box.tag_add(tn, ls, ls + "+1c")
+        box.insert("end", "\n")
+        box.insert("end", getattr(self, "help_txt", ""))
+        box.config(state="disabled")
 
     def show_sample(self):
         """示例只读演示窗口：不进入主编辑区，不可编辑。"""
