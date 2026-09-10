@@ -170,6 +170,24 @@ def check_id_elements(text):
     return found
 
 
+DESC_FIELDS = [
+    ("风格", ("风格",)),
+    ("光线", ("光线", "灯光", "光照", "光影", "光感", "光效", "明暗", "高光",
+              "逆光", "侧光", "顶光", "轮廓光", "自然光", "暖光", "冷光", "微光",
+              "补光", "照明", "阴影", "亮度", "明亮", "昏暗")),
+    ("氛围", ("氛围",)),
+]
+
+
+def check_missing_descriptions(text):
+    """检查文本是否包含【风格】【光线】【氛围】描述，返回缺失字段名列表。"""
+    miss = []
+    for name, kws in DESC_FIELDS:
+        if not any(k in text for k in kws):
+            miss.append(name)
+    return miss
+
+
 def clean_show(s):
     """从匹配文本中去掉 <ID_x> 等标签，仅用于界面展示。"""
     return re.sub(r"<[^>]+>", "", s) if s else s
@@ -464,6 +482,7 @@ def analyze_text(text):
             if mt:
                 issues.append(Issue(b.start + mt.start(), b.start + mt.end(), "error", "缺失", bi + 1,
                                     f"{b.tag_text}环境句：未识别到【景别】（如全景/特写/中景/近景等），请补全"))
+
         # 标点
         for s, e, kind, msg in check_punctuation(seg, excl):
             issues.append(Issue(b.start + s, b.start + e, "error", kind, bi + 1, f"句{bi + 1}: {msg}"))
@@ -827,12 +846,22 @@ class App:
         root.bind("<Control-s>", lambda e: self.save())
         root.bind("<Control-Return>", lambda e: self.mark_done())
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 崩溃日志：记录启动与所有异常，闪退后可查根因
+        self._log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_desc_tool.log")
+        sys.excepthook = self._excepthook
+        self._log("启动视频描述工具")
 
         self._set_status("就绪。粘贴文本后自动解析；光标所在的句子即当前编辑块；选中文字即变为语块。")
         # 禁用最大化/全屏（该窗口不允许全屏）：窗口映射后移除 WS_MAXIMIZEBOX 样式
         self.root.after(300, self._disable_maximize)
         # 启动时自动恢复上次会话
         self.root.after(200, self._auto_load)
+        # 防丢数据：Tk 回调异常兜底（记录 + 立即保存，不闪退）
+        self.root.report_callback_exception = self._safe_callback_exception
+        # 每 3 秒静默检查一次内容变化并自动保存，闪退/强杀也不丢数据
+        self._last_autosave = None
+        if not os.environ.get("VDT_NO_AUTOSAVE"):
+            self.root.after(3000, self._autosave_loop)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -849,30 +878,42 @@ class App:
         ttk.Checkbutton(top, text="窗口置顶", variable=self.topmost_var,
                         command=self._toggle_topmost).pack(side=tk.LEFT, padx=(16, 2))
 
-        # 主区域：左侧文本（最小 640px 宽，保证可见），右侧面板
+        # 主区域：左侧文本 + 右侧面板，中间分隔条可拖动调节宽度
         main = ttk.Frame(self.root)
         # 注意：main.pack 在 _build_ui 末尾（状态栏 pack 之后）调用，
         # 保证小窗口时底部状态栏优先占位、不被主区域挤压
         main.rowconfigure(0, weight=1)
-        main.columnconfigure(0, weight=1, minsize=640)   # 文本列：占满剩余宽度，至少 640
-        main.columnconfigure(1, weight=0, minsize=300)   # 右侧面板：自然宽度，至少 300
+        main.columnconfigure(0, weight=1)
 
+        self.paned = ttk.Panedwindow(main, orient=tk.HORIZONTAL)
+        self.paned.grid(row=0, column=0, sticky="nsew")
+        left = ttk.Frame(self.paned)
         self.text = scrolledtext.ScrolledText(
-            main, wrap="char", undo=True, font=("Microsoft YaHei UI", 12),
+            left, wrap="char", undo=True, font=("Microsoft YaHei UI", 12),
             padx=8, pady=8, width=80)
-        self.text.grid(row=0, column=0, sticky="nsew")
+        self.text.pack(fill=tk.BOTH, expand=True)
+        self.paned.add(left, weight=1)
+        # 文本框下方：全文缺【风格】【光线】【氛围】描述时显示报错
+        self.desc_warn = ttk.Label(main, text="", foreground="#c00000", anchor=tk.W,
+                                   font=("Microsoft YaHei UI", 10, "bold"))
+        self.desc_warn.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 2))
+        self.desc_warn.grid_remove()
 
-        right = ttk.Frame(main)
-        right.grid(row=0, column=1, sticky="nsew")
+        right = ttk.Frame(self.paned)
+        self.paned.add(right, weight=0)
 
-        nb = ttk.Notebook(right)
-        nb.pack(fill=tk.BOTH, expand=True)
+        self.nb = ttk.Notebook(right)
+        nb = self.nb  # 兼容后续局部引用
+        self.nb.pack(fill=tk.BOTH, expand=True)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_nb_tab_change)
 
         # 当前块检查
         t1 = ttk.Frame(nb, padding=6)
-        nb.add(t1, text="当前块检查")
-        self.cur_info = ttk.Label(t1, text="（未解析）", wraplength=300, justify=tk.LEFT)
-        self.cur_info.pack(anchor=tk.W)
+        nb.add(t1, text="要素检查")
+        self.cur_info = ttk.Label(t1, text="（未解析）", wraplength=280, justify=tk.LEFT)
+        self.cur_info.pack(anchor=tk.W, fill=tk.X)
+        self.cur_info.bind("<Configure>",
+                           lambda e: self.cur_info.config(wraplength=max(100, e.width - 8)))
         self.check_rows = {}
         self.check_lf = ttk.LabelFrame(t1, text="五要素（ID 首次出现）")
         self.check_lf.pack(fill=tk.X, pady=6)
@@ -882,37 +923,48 @@ class App:
             ttk.Label(row, text=f"{e}", width=4, font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
             val = ttk.Label(row, text="—", anchor=tk.W)
             val.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            val.bind("<Configure>", lambda e, vv=val: vv.config(wraplength=max(60, e.width - 8)))
             self.check_rows[e] = val
-        self.part_summary = ttk.Label(t1, text="", wraplength=300, justify=tk.LEFT)
-        self.part_summary.pack(anchor=tk.W, pady=(6, 0))
-        self.cur_note = ttk.Label(t1, text="", wraplength=300, justify=tk.LEFT, foreground="#666666")
-        self.cur_note.pack(anchor=tk.W, pady=(4, 0))
+        self.part_summary = ttk.Label(t1, text="", wraplength=280, justify=tk.LEFT)
+        self.part_summary.pack(anchor=tk.W, pady=(6, 0), fill=tk.X)
+        self.part_summary.bind("<Configure>",
+                               lambda e: self.part_summary.config(wraplength=max(100, e.width - 8)))
+        self.cur_note = ttk.Label(t1, text="", wraplength=280, justify=tk.LEFT, foreground="#666666")
+        self.cur_note.pack(anchor=tk.W, pady=(4, 0), fill=tk.X)
+        self.cur_note.bind("<Configure>",
+                           lambda e: self.cur_note.config(wraplength=max(100, e.width - 8)))
 
         # 问题/提示（先于块列表）
         t3 = ttk.Frame(nb, padding=6)
-        nb.add(t3, text="问题/提示")
+        nb.add(t3, text="报错")
         self.issue_count = ttk.Label(t3, text="")
         self.issue_count.pack(anchor=tk.W)
-        self.issue_list = tk.Listbox(t3, font=("Microsoft YaHei UI", 10), exportselection=False)
+        self.issue_list = tk.Text(t3, font=("Microsoft YaHei UI", 10), wrap="char",
+                                  height=8, padx=4, pady=2, state="disabled")
         sb3 = ttk.Scrollbar(t3, command=self.issue_list.yview)
         self.issue_list.config(yscrollcommand=sb3.set)
         self.issue_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb3.pack(side=tk.RIGHT, fill=tk.Y)
+        self.issue_list.tag_configure("err", foreground="#c00000")
+        self.issue_list.tag_configure("hint", foreground="#555555")
+        self.issue_list.tag_configure("hl", background="#FFE9A8")
         self.issue_list.bind("<Double-Button-1>", self._on_issue_jump)
 
         # 块列表
         t2 = ttk.Frame(nb, padding=6)
         nb.add(t2, text="块列表（按句）")
-        self.block_list = tk.Listbox(t2, font=("Microsoft YaHei UI", 10), exportselection=False)
+        self.block_list = tk.Text(t2, font=("Microsoft YaHei UI", 10), wrap="char",
+                                  height=8, padx=4, pady=2, state="disabled")
         sb2 = ttk.Scrollbar(t2, command=self.block_list.yview)
         self.block_list.config(yscrollcommand=sb2.set)
         self.block_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
-        self.block_list.bind("<<ListboxSelect>>", self._on_block_select)
+        self.block_list.tag_configure("done", foreground="#8a8a8a")
+        self.block_list.tag_configure("cur", foreground="#1a5fb4")
+        self.block_list.bind("<Button-1>", self._on_block_click)
 
-        # 图例与帮助
+        # 图例与帮助（add 移到质检之后）
         t4 = ttk.Frame(nb, padding=8)
-        nb.add(t4, text="图例/帮助")
         leg = ttk.Frame(t4)
         leg.pack(anchor=tk.W)
         for tag, desc in LEGEND:
@@ -957,26 +1009,34 @@ class App:
             "“示例（只读）”在独立只读窗口中演示，不影响你的文本。\n"
             "“保存”会把当前文本与处理进度存到本地 .json。"
         )
-        ttk.Label(t4, text=help_txt, justify=tk.LEFT, foreground="#333333").pack(anchor=tk.W, pady=8)
+        self.help_label = ttk.Label(t4, text=help_txt, justify=tk.LEFT, foreground="#333333",
+                                    wraplength=280)
+        self.help_label.pack(anchor=tk.W, pady=8, fill=tk.X)
+        self.help_label.bind("<Configure>",
+                             lambda e: self.help_label.config(wraplength=max(120, e.width - 8)))
 
-        # 质检输出
-        t5 = ttk.Frame(nb, padding=6)
-        nb.add(t5, text="质检输出")
+        # 质检
+        t5 = ttk.Frame(self.nb, padding=6)
+        self.nb.add(t5, text="质检")
+        nb.add(t4, text="图例/帮助")
         qc_top = ttk.Frame(t5)
         qc_top.pack(fill=tk.X, pady=(0, 4))
         ttk.Button(qc_top, text="加入选中", command=self._qc_add_sel).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Label(qc_top, text="先在左侧选中文字，再点下方标签；悬停标签可看说明",
-                  foreground="#666666").pack(side=tk.LEFT)
-        qc_btns = ttk.Frame(t5)
-        qc_btns.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(qc_top, text="要素缺失", command=self._qc_add_missing).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(qc_top, text="先选中文字再点标签", foreground="#666666").pack(side=tk.LEFT)
+        self.qc_btns = ttk.Frame(t5)
+        self.qc_btns.pack(fill=tk.X, pady=(0, 4))
+        self._qc_btn_widgets = []
         for i, (label, desc) in enumerate(QC_TAGS):
-            b = ttk.Button(qc_btns, text=label, command=lambda l=label: self._qc_add_tag(l))
+            b = ttk.Button(self.qc_btns, text=label, command=lambda l=label: self._qc_add_tag(l))
             b.grid(row=i // 3, column=i % 3, padx=2, pady=2, sticky="ew")
             Tooltip(b, desc)
-        for c in range(3):
-            qc_btns.columnconfigure(c, weight=1)
-        self.qc_text = tk.Text(t5, font=("Microsoft YaHei UI", 10), wrap="word",
-                               undo=True, padx=4, pady=4)
+            self._qc_btn_widgets.append(b)
+        self.qc_btns.bind("<Configure>", self._qc_relayout_buttons)
+        self.root.after(60, self._qc_relayout_buttons)
+        # wrap=char：任何长内容都强制换行，屏幕/窗口任意尺寸下右侧不被遮挡
+        self.qc_text = tk.Text(t5, font=("Microsoft YaHei UI", 10), wrap="char",
+                               width=24, undo=True, padx=4, pady=4)
         qc_sb = ttk.Scrollbar(t5, command=self.qc_text.yview)
         self.qc_text.config(yscrollcommand=qc_sb.set)
         self.qc_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1041,11 +1101,12 @@ class App:
         n_e = sum(1 for i in self.issues if i.level == "error")
         n_h = sum(1 for i in self.issues if i.level == "hint")
         self._set_status(f"已解析：{len(self.blocks)} 个句子块，错误 {n_e} 条，提示 {n_h} 条。")
-        # 内容稳定后自动保存，重启不丢失
-        try:
-            self.save(silent=True)
-        except Exception:
-            pass
+        # 内容稳定后自动保存，重启不丢失（测试环境可设 VDT_NO_AUTOSAVE 关闭）
+        if not os.environ.get("VDT_NO_AUTOSAVE"):
+            try:
+                self.save(silent=True)
+            except Exception:
+                pass
 
     def _schedule_parse(self):
         if self._parse_job:
@@ -1469,6 +1530,49 @@ class App:
             return "break"
         return None
 
+    def _qc_add_missing(self):
+        """点击“要素缺失”：检测当前块缺失的风格/光线/氛围，输出“风格、光线缺失”格式。"""
+        miss = check_missing_descriptions(self.raw_text)
+        if not miss:
+            self._set_status("全文风格/光线/氛围描述齐全。")
+            return
+        qc = self.qc_text
+        pos = qc.index("insert")
+        text = "、".join(f"{m}" for m in miss) + "缺失"
+        qc.insert(pos, text)
+        qc.mark_set("insert", qc.index(f"{pos}+{len(text)}c"))
+        qc.see("insert")
+        qc.focus_set()
+
+    def _on_nb_tab_change(self, event=None):
+        """切换 tab：切到“质检输出”时延迟重排按钮（此时面板已布局，宽度真实）。"""
+        try:
+            cur = self.nb.index("current")
+        except tk.TclError:
+            return
+        if cur >= 0 and self.nb.tab(cur, "text") == "质检输出":
+            self.root.after(30, self._qc_relayout_buttons)
+
+    def _qc_relayout_buttons(self, event=None):
+        """标签按钮列数自适应：可用宽度窄时减列，避免右侧被遮挡。"""
+        w = event.width if event is not None else self.qc_btns.winfo_width()
+        if w < 10:
+            return
+        longest = max(len(b.cget("text")) for b in self._qc_btn_widgets)
+        need = longest * 12 + 24  # 每字符约 12px，加按钮内边距
+        cols = max(1, min(4, w // need))
+        for i, b in enumerate(self._qc_btn_widgets):
+            b.grid_forget()
+            b.grid(row=i // cols, column=i % cols, padx=2, pady=2, sticky="ew")
+        for c in range(cols):
+            self.qc_btns.columnconfigure(c, weight=1)
+        for c in range(cols, 5):
+            self.qc_btns.columnconfigure(c, weight=0)
+
+    def _qc_issue_candidates(self):
+        """问题标签候选：真实性问题/客观性问题等（加入选中后自动弹出）。"""
+        return [(lbl, lbl, len(lbl), False) for lbl, _ in QC_TAGS]
+
     def _qc_add_sel(self):
         """把左侧选中的文字复制到质检输出，其后加冒号。"""
         try:
@@ -1482,12 +1586,18 @@ class App:
         if not txt:
             return
         qc = self.qc_text
-        if qc.get("1.0", "end-1c").strip():
-            qc.insert(tk.END, "\n" + txt + "：")
-        else:
-            qc.insert(tk.END, txt + "：")
-        qc.mark_set("insert", "end-1c")
-        qc.see("end")
+        # 跟随光标：在光标处插入；光标不在行首时先换行，保证新条目独立成行
+        pos = qc.index("insert")
+        line_start = qc.index(pos + " linestart")
+        prefix = "" if pos == line_start else "\n"
+        insert_txt = prefix + txt + "："
+        qc.insert(pos, insert_txt)
+        # 光标停在冒号后，便于直接选标签接在冒号后
+        qc.mark_set("insert", qc.index(pos + " +%dc" % len(insert_txt)))
+        qc.see("insert")
+        # 加入选中后自动联想问题标签
+        self._qc_ac_start_idx = qc.index("insert")
+        self._qc_ac_show(self._qc_issue_candidates())
         qc.focus_set()
 
     def _qc_add_tag(self, label):
@@ -1518,14 +1628,15 @@ class App:
             for m in TAG_RE.finditer(self.raw_text):
                 tags.add(m.group(0))
             items = []
-            if ch and ch.isdigit():
-                d = int(ch)
-                for t in sorted(tags):
-                    if t.startswith("<ID_%d>" % d) or t.startswith("<ENV_%d>" % d):
-                        items.append((t, t, len(t), True))
+
             def _tag_key(x):
                 m = TAG_RE.match(x)
-                return (m.group("kind"), int(m.group("num")))
+                return (0 if m.group("kind") == "ID" else 1, int(m.group("num")))
+            if ch and ch.isdigit():
+                d = int(ch)
+                for t in sorted(tags, key=_tag_key):
+                    if t.startswith("<ID_%d>" % d) or t.startswith("<ENV_%d>" % d):
+                        items.append((t, t, len(t), True))
             for t in sorted(tags, key=_tag_key):
                 if (t, t, len(t), True) not in items:
                     items.append((t, t, len(t), True))
@@ -1726,17 +1837,23 @@ class App:
         qc.see("insert")
         self._prev_qc_text = qc.get("1.0", "end-1c")
 
-    def _on_block_select(self, event=None):
-        sel = self.block_list.curselection()
-        if sel:
-            self.current_idx = sel[0]
+    def _on_block_click(self, event=None):
+        try:
+            idx = int(self.block_list.index("@%d,%d" % (event.x, event.y)).split(".")[0]) - 1
+        except tk.TclError:
+            return
+        if 0 <= idx < len(self.blocks):
+            self.current_idx = idx
             self.refresh(scroll=True)
 
     def _on_issue_jump(self, event=None):
-        sel = self.issue_list.curselection()
-        if not sel or sel[0] >= len(self.issues):
+        try:
+            idx = int(self.issue_list.index("@%d,%d" % (event.x, event.y)).split(".")[0]) - 1
+        except tk.TclError:
             return
-        iss = self.issues[sel[0]]
+        if not (0 <= idx < len(self.issues)):
+            return
+        iss = self.issues[idx]
         idx = f"1.0+{iss.start}c"
         self.text.see(idx)
         self.text.mark_set("insert", idx)
@@ -1752,10 +1869,9 @@ class App:
             return
         for i, iss in enumerate(self.issues):
             if iss.level == "error" and iss.start <= pos < max(iss.end, iss.start + 1):
-                self.issue_list.selection_clear(0, "end")
-                self.issue_list.selection_set(i)
-                self.issue_list.see(i)
-                self.issue_list.activate(i)
+                self.issue_list.tag_remove("hl", "1.0", "end")
+                self.issue_list.tag_add("hl", f"{i + 1}.0", f"{i + 1}.end")
+                self.issue_list.see(f"{i + 1}.0")
                 return
 
     # ---------- 高亮与面板刷新 ----------
@@ -1765,32 +1881,45 @@ class App:
 
     def refresh(self, scroll=False):
         self._apply_highlights()
-        # 块列表
-        self.block_list.delete(0, tk.END)
+        # 块列表（Text，自动换行自适应）
+        self.block_list.config(state="normal")
+        self.block_list.delete("1.0", "end")
         for i, b in enumerate(self.blocks):
             preview = b.text[:26].replace("\n", " ")
             tag = b.tag_text if b.tag_text else "(无标签)"
             if b.done:
-                mark, fg = "✓", "#8a8a8a"
+                mark, tagname = "✓", "done"
             elif i == self.current_idx:
-                mark, fg = "▶", "#1a5fb4"
+                mark, tagname = "▶", "cur"
             else:
-                mark, fg = "○", "#000000"
+                mark, tagname = "○", None
             label = f"{mark} 块{i + 1} {tag} {preview}"
-            self.block_list.insert(tk.END, label)
-            self.block_list.itemconfig(i, foreground=fg)
+            self.block_list.insert("end", label + "\n")
+            if tagname:
+                self.block_list.tag_add(tagname, f"{i + 1}.0", f"{i + 1}.end")
+        self.block_list.delete("end-1c")
         if self.current_idx < len(self.blocks):
-            self.block_list.see(self.current_idx)
-            self.block_list.selection_clear(0, tk.END)
-            self.block_list.selection_set(self.current_idx)
-        # 问题列表
-        self.issue_list.delete(0, tk.END)
+            self.block_list.see(f"{self.current_idx + 1}.0")
+        self.block_list.config(state="disabled")
+        # 全文描述检查：风格/光线/氛围 每个字段全文出现一次即可
+        miss = check_missing_descriptions(self.raw_text)
+        if miss:
+            self.desc_warn.config(text="⚠ " + "、".join(f"{m}描述缺失" for m in miss))
+            self.desc_warn.grid()
+        else:
+            self.desc_warn.config(text="")
+            self.desc_warn.grid_remove()
+        # 问题列表（Text，自动换行自适应）
+        self.issue_list.config(state="normal")
+        self.issue_list.delete("1.0", "end")
         for i, iss in enumerate(self.issues):
             sym = "⚠" if iss.level == "error" else "ℹ"
-            fg = "#c00000" if iss.level == "error" else "#555555"
+            tagname = "err" if iss.level == "error" else "hint"
             label = f"{sym} 块{iss.block_idx} {iss.message}"
-            self.issue_list.insert(tk.END, label)
-            self.issue_list.itemconfig(i, foreground=fg)
+            self.issue_list.insert("end", label + "\n")
+            self.issue_list.tag_add(tagname, f"{i + 1}.0", f"{i + 1}.end")
+        self.issue_list.delete("end-1c")
+        self.issue_list.config(state="disabled")
         n_e = sum(1 for i in self.issues if i.level == "error")
         n_h = sum(1 for i in self.issues if i.level == "hint")
         self.issue_count.config(text=f"错误 {n_e} 条 · 提示 {n_h} 条（双击跳转）")
@@ -1916,6 +2045,58 @@ class App:
     def _set_status(self, msg):
         self.status.config(text=msg)
 
+    def _log(self, msg):
+        try:
+            import time
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + msg + "\n")
+        except Exception:
+            pass
+
+    def _excepthook(self, exc, val, tb):
+        """主线程未捕获异常：记录日志（不向用户弹窗）。"""
+        try:
+            import traceback
+            self._log("未捕获异常:\n" + "".join(traceback.format_exception(exc, val, tb)))
+        except Exception:
+            pass
+
+    def _safe_callback_exception(self, exc, val, tb):
+        """Tk 回调异常兜底：记录日志 + 立即保存当前内容，避免闪退丢数据。"""
+        try:
+            import traceback
+            self._log("Tk回调异常:\n" + "".join(traceback.format_exception(exc, val, tb)))
+        except Exception:
+            pass
+        try:
+            self.save(silent=True)
+            self._set_status("发生内部异常，已自动保存当前内容（可继续操作）")
+        except Exception:
+            try:
+                self._set_status("发生内部异常，且自动保存失败，请尽快手动保存")
+            except Exception:
+                pass
+
+    def _autosave_loop(self):
+        """每 3 秒检查内容（文本/完成状态/质检输出）是否变化，变化即静默写盘。"""
+        try:
+            cur = (self.raw_text,
+                   sorted(k[1] for k in self.done_keys),
+                   self.qc_text.get("1.0", "end-1c"))
+            if cur != self._last_autosave:
+                self._last_autosave = cur
+                try:
+                    self.save(silent=True)
+                except Exception as e:
+                    self._log("自动保存失败: %r" % (e,))
+        except Exception as e:
+            self._log("自动保存检查异常: %r" % (e,))
+        try:
+            if not os.environ.get("VDT_NO_AUTOSAVE"):
+                self.root.after(3000, self._autosave_loop)
+        except Exception:
+            pass
+
     # ---------- 文件与示例 ----------
     def save(self, silent=False):
         data = {
@@ -1926,8 +2107,11 @@ class App:
         }
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_desc_session.json")
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            # 原子写入：先写临时文件再替换，避免保存中途被强杀导致 json 半写损坏
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
             if not silent:
                 gaps = check_time_gaps(self.raw_text)
                 if gaps:
@@ -1982,6 +2166,14 @@ class App:
         try:
             self.save(silent=True)
         finally:
+            try:
+                # 正常关窗标记：启动器据此判断是正常退出（不再重启）
+                flag = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "video_desc_normal_exit.flag")
+                with open(flag, "w", encoding="utf-8"):
+                    pass
+            except Exception:
+                pass
             self.root.destroy()
 
     def show_sample(self):

@@ -1,0 +1,21 @@
+2026-09-10 14:36:42 启动视频描述工具
+2026-09-10 14:36:43 未捕获异常:
+Traceback (most recent call last):
+  File "<string>", line 19, in <module>
+    print('sash位置:', app.paned.sash_coord(0))
+                       ~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\EDY\AppData\Local\Doubao\User Data\sandbox_runtime\bases\c98c5042338ed152c6f10ecd8591889f\python\Lib\tkinter\__init__.py", line 4945, in sash_coord
+    return self.sash("coord", index)
+           ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "C:\Users\EDY\AppData\Local\Doubao\User Data\sandbox_runtime\bases\c98c5042338ed152c6f10ecd8591889f\python\Lib\tkinter\__init__.py", line 4931, in sash
+    self.tk.call((self._w, 'sash') + args)) or ()
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+_tkinter.TclError: expected integer but got "coord"
+
+2026-09-10 14:36:54 启动视频描述工具
+2026-09-10 14:38:56 启动视频描述工具
+2026-09-10 14:39:01 启动视频描述工具
+2026-09-10 14:39:29 启动视频描述工具
+2026-09-10 15:14:02 启动视频描述工具
+2026-09-10 15:14:21 启动视频描述工具
+2026-09-10 15:45:17 启动视频描述工具
